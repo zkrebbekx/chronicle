@@ -20,6 +20,20 @@ func memStore(t chroniclefest.T) chronicle.Store {
 	return store
 }
 
+// TestMemStoreCompliance runs the deletion and legal-hold conformance suite
+// against the reference implementation.
+func TestMemStoreCompliance(t *testing.T) {
+	chroniclefest.RunCompliance(t, memStore)
+}
+
+// TestMemKeyring runs the keyring conformance suite against the in-memory
+// keyring.
+func TestMemKeyring(t *testing.T) {
+	chroniclefest.RunKeyring(t, func(chroniclefest.T) chronicle.Keyring {
+		return chronicle.NewMemKeyring()
+	})
+}
+
 // TestMemStoreHalves runs each half of the suite on its own. A store author who
 // has not implemented the bitemporal engine's expectations yet still wants the
 // store-level contract to be runnable, so the halves are public API and have to
