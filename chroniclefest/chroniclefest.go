@@ -1100,6 +1100,124 @@ func runLog(t T, newStore Factory) {
 				}
 			})
 		})
+
+		runFieldHistory(t, newStore)
+	})
+}
+
+// ---------------------------------------------------------------------------
+// field history — the single-field audit trail
+// ---------------------------------------------------------------------------
+
+// runFieldHistory exercises Log.FieldHistory through the store. It is purely a
+// read-side composition over Query and the diff comparison, so it adds no store
+// method; running it here is just checking that the composition lands the same
+// answers on every store. Transaction instants come from the writes' own
+// results, never assumed, so a store that assigns its own tx time is fine.
+func runFieldHistory(t T, newStore Factory) {
+	ctx := context.Background()
+
+	t.Run("when a field is asserted then retroactively corrected", func(t T) {
+		s := newStore(t)
+		l := chronicle.NewLog(s)
+
+		first, err := l.Put(ctx, employee, "e1", []byte(`{"salary":100,"title":"eng"}`), feb, apr, alice)
+		if err != nil {
+			t.Fatalf("Put failed: %v", err)
+		}
+		corrected, err := l.Correct(ctx, employee, "e1", []byte(`{"salary":120,"title":"eng"}`), feb, apr, bob)
+		if err != nil {
+			t.Fatalf("Correct failed: %v", err)
+		}
+
+		t.Run("then the salary field shows the assertion then the correction", func(t T) {
+			revs, err := l.FieldHistory(ctx, employee, "e1", "/salary", chronicle.As{ValidAt: mar})
+			if err != nil {
+				t.Fatalf("FieldHistory failed: %v", err)
+			}
+			if len(revs) != 2 {
+				t.Fatalf("salary revisions = %d; want 2: %+v", len(revs), revs)
+			}
+			if revs[0].From.Present || !revs[0].To.Present || fmt.Sprint(revs[0].To.Value) != "100" {
+				t.Fatalf("first revision = %+v; want absent -> 100", revs[0])
+			}
+			if revs[0].Intent != chronicle.IntentAssert || revs[0].Actor.ID != alice.ID || !revs[0].TxAt.Equal(first.TxAt) {
+				t.Fatalf("first revision attribution = %+v; want assert by alice at %s", revs[0], first.TxAt)
+			}
+			if fmt.Sprint(revs[1].From.Value) != "100" || fmt.Sprint(revs[1].To.Value) != "120" {
+				t.Fatalf("second revision = %+v; want 100 -> 120", revs[1])
+			}
+			if revs[1].Intent != chronicle.IntentCorrection || revs[1].Actor.ID != bob.ID || !revs[1].TxAt.Equal(corrected.TxAt) {
+				t.Fatalf("second revision attribution = %+v; want correction by bob at %s", revs[1], corrected.TxAt)
+			}
+		})
+
+		t.Run("then a field that did not change shows only its first appearance", func(t T) {
+			revs, err := l.FieldHistory(ctx, employee, "e1", "/title", chronicle.As{ValidAt: mar})
+			if err != nil {
+				t.Fatalf("FieldHistory failed: %v", err)
+			}
+			if len(revs) != 1 {
+				t.Fatalf("title revisions = %d; want 1 — the title never changed", len(revs))
+			}
+		})
+
+		t.Run("then a descending walk reverses the order", func(t T) {
+			revs, err := l.FieldHistory(ctx, employee, "e1", "/salary", chronicle.As{ValidAt: mar}, chronicle.FieldHistoryDescending())
+			if err != nil {
+				t.Fatalf("FieldHistory failed: %v", err)
+			}
+			if len(revs) != 2 || !revs[0].TxAt.Equal(corrected.TxAt) {
+				t.Fatalf("descending revisions = %+v; want the correction first", revs)
+			}
+		})
+	})
+
+	t.Run("when a later belief drops the field entirely", func(t T) {
+		s := newStore(t)
+		l := chronicle.NewLog(s)
+		if _, err := l.Put(ctx, employee, "e2", []byte(`{"salary":100}`), feb, apr, alice); err != nil {
+			t.Fatalf("Put failed: %v", err)
+		}
+		if _, err := l.Correct(ctx, employee, "e2", []byte(`null`), feb, apr, bob); err != nil {
+			t.Fatalf("Correct failed: %v", err)
+		}
+
+		t.Run("then the field goes from present to absent", func(t T) {
+			revs, err := l.FieldHistory(ctx, employee, "e2", "/salary", chronicle.As{ValidAt: mar})
+			if err != nil {
+				t.Fatalf("FieldHistory failed: %v", err)
+			}
+			if len(revs) != 2 {
+				t.Fatalf("revisions = %d; want 2", len(revs))
+			}
+			if !revs[1].From.Present || revs[1].To.Present {
+				t.Fatalf("second revision = %+v; want present -> absent", revs[1])
+			}
+		})
+	})
+
+	t.Run("when the field never existed", func(t T) {
+		s := newStore(t)
+		l := chronicle.NewLog(s)
+		if _, err := l.Put(ctx, employee, "e3", []byte(`{"salary":100}`), feb, apr, alice); err != nil {
+			t.Fatalf("Put failed: %v", err)
+		}
+		t.Run("then a never-present path is an empty result, not an error", func(t T) {
+			revs, err := l.FieldHistory(ctx, employee, "e3", "/bonus", chronicle.As{ValidAt: mar})
+			if err != nil {
+				t.Fatalf("FieldHistory failed: %v", err)
+			}
+			if len(revs) != 0 {
+				t.Fatalf("revisions = %d; want 0", len(revs))
+			}
+		})
+		t.Run("then a malformed pointer is ErrInvalidPath", func(t T) {
+			_, err := l.FieldHistory(ctx, employee, "e3", "not-a-pointer", chronicle.As{ValidAt: mar})
+			if !errors.Is(err, chronicle.ErrInvalidPath) {
+				t.Fatalf("FieldHistory = %v; want ErrInvalidPath", err)
+			}
+		})
 	})
 }
 

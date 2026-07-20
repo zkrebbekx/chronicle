@@ -102,10 +102,30 @@
 // [Log.History] returns every version an entity has ever had, superseded ones
 // included. [Log.Timeline] returns the valid-time sequence as believed at one
 // transaction instant. [Log.Diff] reports field-level changes between two
-// points. [Log.Query] filters across entities by kind, entity, actor, intent
-// and time on either axis, and pages with an opaque keyset [Cursor] whose
-// final tiebreaker is the unique record ID, so no row can be skipped or
-// repeated at a page boundary however many records share a timestamp.
+// points. [Log.FieldHistory] walks how belief about one field evolved over
+// transaction time at a fixed valid point. [Log.Query] filters across entities
+// by kind, entity, actor, intent and time on either axis, and pages with an
+// opaque keyset [Cursor] whose final tiebreaker is the unique record ID, so no
+// row can be skipped or repeated at a page boundary however many records share a
+// timestamp.
+//
+// # Field history
+//
+// [Log.FieldHistory] is the single-field audit trail: for one entity's state as
+// valid at a fixed point in the world, it returns each time the recorded value
+// of one field changed, along the transaction axis — who changed it, when we
+// learned it, and whether it was an assertion or a correction. It is a
+// composition over the query surface and the diff comparison, so it needs
+// nothing a store does not already provide and behaves identically on every
+// store.
+//
+// The field is named by an RFC 6901 JSON Pointer, the same grammar [Log.Diff]
+// emits. Each returned [FieldRevision] carries the field's previous and new
+// value as a [FieldValue], which keeps an absent field distinct from one
+// explicitly set to JSON null — the classic subtle bug in a field-level trail,
+// and the reason the two are separate facts here. Value equality is Diff's, so a
+// value re-recorded in different notation (100 then 100.0) is not reported as a
+// change.
 //
 // # Diffing
 //

@@ -229,6 +229,33 @@ func BenchmarkDiff(b *testing.B) {
 	}
 }
 
+// BenchmarkFieldHistoryLongHistory walks one field back through a long
+// transaction history at a fixed valid point. Every correction covers the
+// point, so the walk decodes all of them: this is the linear cost the doc
+// comment promises, measured.
+func BenchmarkFieldHistoryLongHistory(b *testing.B) {
+	ctx := context.Background()
+	clock := NewFixedClock(t0)
+	l := NewLog(NewMemStore(), WithClock(clock))
+	for i := 0; i < 500; i++ {
+		clock.Set(t0.Add(time.Duration(i) * time.Hour))
+		if _, err := l.Correct(ctx, employee, "e",
+			[]byte(fmt.Sprintf(`{"salary":%d,"title":"engineer"}`, i)),
+			t2, t4, benchActor()); err != nil {
+			b.Fatal(err)
+		}
+	}
+	at := As{ValidAt: t2.Add(24 * time.Hour)}
+
+	var sink []FieldRevision
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		sink, _ = l.FieldHistory(ctx, employee, "e", "/salary", at)
+	}
+	_ = sink
+}
+
 func BenchmarkIntervalOverlaps(b *testing.B) {
 	pairs := []struct{ a, c Interval }{
 		{Between(t1, t3), Between(t2, t4)},

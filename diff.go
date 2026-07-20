@@ -5,7 +5,6 @@ import (
 	"math/big"
 	"reflect"
 	"slices"
-	"strings"
 )
 
 // ChangeOp describes what happened to a field between two points.
@@ -197,24 +196,4 @@ func diffArrays(path string, oldVal, newVal []any, out *[]FieldChange) {
 			diffValues(child, oldVal[i], newVal[i], out)
 		}
 	}
-}
-
-// escapePointer applies RFC 6901 escaping to one JSON Pointer reference token.
-func escapePointer(s string) string {
-	if !strings.ContainsAny(s, "~/") {
-		return s
-	}
-	var b strings.Builder
-	b.Grow(len(s) + 4)
-	for _, r := range s {
-		switch r {
-		case '~':
-			b.WriteString("~0")
-		case '/':
-			b.WriteString("~1")
-		default:
-			b.WriteRune(r)
-		}
-	}
-	return b.String()
 }

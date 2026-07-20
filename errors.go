@@ -70,6 +70,15 @@ var (
 	// truncated, or fails its checksum.
 	ErrInvalidCursor = errors.New("chronicle: invalid cursor")
 
+	// ErrInvalidPath is returned by [Log.FieldHistory] for a path that is not a
+	// well-formed RFC 6901 JSON Pointer — one that does not begin with '/', or
+	// whose '~' escapes are malformed. It is deliberately distinct from a path
+	// that is well formed but matches nothing: a syntactically broken pointer is
+	// a caller bug, while a pointer that no record happens to contain is an
+	// ordinary empty result, not an error. Errors wrapping it are always a
+	// [*PathError].
+	ErrInvalidPath = errors.New("chronicle: invalid path")
+
 	// ErrMissingEntityID is returned when a write or lookup names no entity.
 	// An empty entity ID is always a caller bug rather than a wildcard;
 	// treating it as one would let a typo write into a shared phantom history.
@@ -162,6 +171,23 @@ func (e *IntervalError) Error() string {
 
 // Unwrap returns the wrapped sentinel so [errors.Is] matches.
 func (e *IntervalError) Unwrap() error { return e.Err }
+
+// PathError reports a malformed JSON Pointer, carrying the offending path and
+// why it was rejected. It wraps [ErrInvalidPath].
+type PathError struct {
+	// Path is the offending pointer, as the caller supplied it.
+	Path string
+	// Reason says what is wrong with it.
+	Reason string
+}
+
+// Error implements the error interface.
+func (e *PathError) Error() string {
+	return fmt.Sprintf("chronicle: invalid JSON Pointer %q: %s", e.Path, e.Reason)
+}
+
+// Unwrap returns [ErrInvalidPath] so [errors.Is] matches.
+func (e *PathError) Unwrap() error { return ErrInvalidPath }
 
 // KindError reports a rejected entity kind. It wraps [ErrUnknownKind].
 type KindError struct {
