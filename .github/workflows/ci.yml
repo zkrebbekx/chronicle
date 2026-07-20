@@ -44,7 +44,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        go: ["1.23", "1.24", "1.25"]
+        # pgstore requires go 1.24: its test-only driver dependencies (pgx
+        # v5.8+) set that floor, and go 1.23 is past upstream EOL. The root
+        # module is zero-dependency and keeps 1.23.
+        go: ["1.24", "1.25"]
     services:
       postgres:
         image: postgres:17-alpine
