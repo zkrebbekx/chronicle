@@ -2,9 +2,10 @@
 
 Bitemporal entity change history for Go. ORM-agnostic, over `database/sql`.
 
-Status: phases 1 and 2 implemented — core model, in-memory store, Postgres
-adapter, conformance suite. Corrections found while implementing are recorded
-inline, marked **Correction**, rather than silently edited away.
+Status: phases 1–3 implemented — core model, in-memory store, Postgres
+adapter, conformance suite, and the compliance layer: retention, legal hold,
+tamper evidence, crypto-shredding. Corrections found while implementing are
+recorded inline, marked **Correction**, rather than silently edited away.
 
 ## Why this exists
 
@@ -298,32 +299,122 @@ optional.
   audit firms only). The "who/what/when/why" formulation vendors attribute to
   Part 11 comes from FDA *guidance* and EU GMP Annex 11, not the regulation.
   chronicle will not claim otherwise.
-- **Retention policies** — per-kind schedules, enforced by a sweeper. Defaults
-  ship as *unset*, because the commonly-cited periods do not apply the way
-  vendors say: HIPAA's six years attaches to written policies and procedures
-  (45 CFR 164.316(b)(1)), not audit logs; the SOX-lineage seven years (PCAOB
-  AS 1215 .14, SEC Rule 2-06) binds the external audit firm's workpapers, not
-  the issuer's database. 21 CFR 11.10(e) is *relative* — as long as the subject
-  records require.
-- **Legal hold** — suspends retention deletion for scoped records. Hold always
-  wins over retention. Critically, FRCP 37(e)'s trigger is "anticipation or
-  conduct of litigation", determined after the fact by a court and **not** by
-  complaint filing, so a hold must accept a **backdated, operator-asserted
-  effective timestamp**. A hold that can only take effect "now" is the wrong
-  shape for the obligation it exists to satisfy.
-- **Tamper evidence** — optional hash chaining, deliberately demoted. Honest
-  threat model, to be stated plainly in the README: a hash chain detects
-  retrospective edits by someone who does **not** control the chain head. It
-  does nothing against an administrator who owns the database and can recompute
-  the entire chain. Only external anchoring changes that. If chronicle does not
-  ship anchoring, it must not imply the stronger guarantee.
-- **Erasure** — GDPR Art.17 versus a non-destructive log. Four research sweeps
-  failed to verify whether any DPA, EDPB guidance or court has accepted
+- **Retention policies** — shipped, phase 3, as package `retain`. Per-kind
+  schedules, enforced by an explicit sweeper with a first-class dry run
+  (`Plan` vs `Execute`). Defaults ship as *unset*, because the commonly-cited
+  periods do not apply the way vendors say: HIPAA's six years attaches to
+  written policies and procedures (45 CFR 164.316(b)(1)), not audit logs; the
+  SOX-lineage seven years (PCAOB AS 1215 .14, SEC Rule 2-06) binds the
+  external audit firm's workpapers, not the issuer's database. 21 CFR 11.10(e)
+  is *relative* — as long as the subject records require. Two decisions made
+  in implementation: eligibility is measured from **TxTo**, not TxFrom — the
+  age that matters is how long a record has been superseded, and aging from
+  TxFrom would destroy a record that stopped being current belief yesterday —
+  and a current record is never eligible at any age, enforced twice, in the
+  sweeper and again in the store's `Delete`, which refuses whole batches.
+  Deletion is a store *capability* (`Deleter`), an optional extension both
+  shipped stores implement, so the core `Store` contract stays destruction-
+  free and third-party stores are not broken by the addition.
+- **Legal hold** — shipped, phase 3. Suspends retention deletion for scoped
+  records. Hold always wins over retention. Critically, FRCP 37(e)'s trigger
+  is "anticipation or conduct of litigation", determined after the fact by a
+  court and **not** by complaint filing, so a hold must accept a **backdated,
+  operator-asserted effective timestamp**. A hold that can only take effect
+  "now" is the wrong shape for the obligation it exists to satisfy.
+
+  **Correction, found during phase 3: "suspends deletion for scoped records
+  from that moment" invites a wrong implementation, and the words above were
+  nearly it.** The tempting reading is that `EffectiveFrom` filters *which
+  records* the hold protects — records newer than the effective instant, on
+  one axis or another. That reading destroys evidence: the preservation duty
+  covers relevant information *however old it is*, so a hold scoped by its
+  own effective date would sweep away exactly the records it was placed to
+  keep. As shipped, `EffectiveFrom` gates only *when the hold is active* — a
+  hold is in force over the half-open `[EffectiveFrom, ReleasedAt)`, and an
+  active hold withholds every record in its kind/entity scope regardless of
+  the record's timestamps. The backdated instant is an operator assertion for
+  the record of controls; it also cannot resurrect anything destroyed before
+  the hold was placed, and the design must not imply otherwise.
+- **Tamper evidence** — shipped, phase 3, and still deliberately demoted:
+  off by default, opt-in via `WithChaining`. Honest threat model, stated
+  plainly on the option and in the README: a hash chain detects retrospective
+  edits by someone who does **not** control the chain head. It does nothing
+  against an administrator who owns the database and can recompute the entire
+  chain. Only external anchoring changes that; `ChainHead` exposes the value
+  to anchor, and chronicle ships no anchoring, so it must not imply the
+  stronger guarantee. The canonical serialization is versioned (a leading
+  format byte, a `v1:` token prefix) so a future change meets an explicit
+  unknown-version divergence rather than a silent mismatch.
+
+  **Correction, found during phase 3: tombstones preserve chain
+  *verifiability*, not the full threat model, and the difference must be
+  stated.** Retention under a chain retains each destroyed record's chain
+  value as a tombstone, and `Verify` passes over the gap. Two things follow
+  that "the chain still verifies" glosses over. First, a tombstone's own hash
+  is unverifiable — the content it summarised is destroyed — so within a run
+  of consecutive tombstones only the *last* one is constrained, by the first
+  surviving successor; the others are carried on trust. Second, the store
+  writes tombstones for whatever it is asked to delete, so an administrator
+  with database access can destroy a chained record *through the tombstone
+  protocol* and Verify passes exactly as it does after a legitimate sweep. A
+  verified chain across a gap therefore proves the survivors are what the
+  head commits to and that *something* with the recorded chain value stood in
+  the gap — never that the destruction was authorised. Distinguishing
+  authorised from unauthorised destruction requires records Verify cannot
+  reach: externally anchored heads plus sweep reports kept out of the
+  administrator's editorial reach.
+
+  **Correction, found during phase 3: the record hash cannot cover TxTo, and
+  "hash the immutable fields" hides a real gap.** TxTo is written *after* the
+  hash, at supersession — the one mutation the model permits — so an editor
+  who only shifts a superseded record's TxTo would go undetected by the hash
+  alone. `Verify` compensates by requiring every superseded chained record's
+  TxTo to equal the TxFrom of some *later chained write* (all of which are
+  hash-covered). That pins TxTo to the set of instants the chain vouches for,
+  but not to the right member of the set: moving a supersession from one
+  chained write's instant to another's remains undetectable. Closing that
+  residue would need per-supersession chain entries, which is a different and
+  heavier design; the gap is documented rather than papered over.
+- **Erasure** — GDPR Art.17 versus a non-destructive log. Shipped, phase 3,
+  as mechanism only: per-subject AES-256-GCM under a pluggable `Keyring`,
+  `DestroyKey` terminal per subject, `Get`/`Diff` failing with `ErrShredded`
+  rather than returning ciphertext, `History` preserving record structure.
+  The hash covers the *ciphertext*, so shredding never touches a chain — the
+  simplest of the available constructions and the reason key destruction and
+  tamper evidence compose without either weakening the other. Four research
+  sweeps failed to verify whether any DPA, EDPB guidance or court has accepted
   destruction of a per-subject key as erasure. **Until that is resolved,
   chronicle documents the mechanism and hedges the legal characterization:**
   "destroying a key renders that subject's historical values unrecoverable;
   whether this constitutes erasure under Art.17 depends on your supervisory
   authority's position." No compliance claim the research does not support.
+
+**Correction, found during phase 3: archive-before-delete cannot be
+transactional through the Store interface, so the archive hook must be
+idempotent — a requirement, not advice.** The archive-table strategy this
+design pointed at was imagined as "copy, then delete, atomically". There is no
+atomically: the caller's archive write runs in the caller's failure domain and
+the deletion in the store's, and `Store` deliberately has no way to run caller
+code inside a store transaction (that door was closed in phase 1 for good
+reasons). If the archive succeeds and the deletion fails — or the process dies
+between the two — the records are still in the store and the next sweep
+archives them again. The contract is therefore: the hook runs *before*
+destruction, its error aborts the batch untouched, and it **must** be
+idempotent (key the archive on record ID; upsert, never append). A
+double-archive on retry is the designed behaviour, because the alternative —
+deleting before archiving — turns the same crash into data loss instead of a
+duplicate row.
+
+**Note, phase 3: chaining trades away the planner's narrowed read.** A chained
+write must link from the entity's chain tail — the greatest current record in
+the total order — which may not overlap the interval being written. So under
+`WithChaining` the log asks the store for *all* of the entity's current
+records (`ApplyRequest.Valid = Always()`) and filters to the overlapping ones
+itself. The narrowing was an optimization and the store contract already
+permitted the wider request; worth knowing when reasoning about the cost of a
+chained write to an entity with many disjoint current intervals. The tail
+read happens inside the store's lock, in the planner, which is what makes the
+chain race-free across processes without any chain-specific locking.
 
 ## Failure modes this design answers
 
@@ -335,7 +426,7 @@ From practitioner reports of hand-rolled systems:
 | WAL/CDC tailing loses business intent | Partly. `Intent` (assert / correct / remainder) is always recorded. `Reason` is free text and **optional** — see COMPLIANCE.md — so it captures intent only where callers supply it. A field you do not require cannot be relied upon; chronicle does not pretend otherwise |
 | Trigger shadow tables drift from schema | History is codec-serialized, not a mirrored column set |
 | Event streams can't reconstruct point-in-time | Full-row records with as-of on both axes |
-| Audit table outgrows the primary | Partitioned on tx-time, retention + archival built in |
+| Audit table outgrows the primary | Retention sweeper (`retain`) plus caller-owned archival via the archive hook. *Not* tx-time partitioning — the phase 2 Correction above proved that incompatible with the exclusion constraint, and this row originally promised it anyway |
 | "Who changed this" across jobs/migrations | Actor is required; no ambient default that silently records "system" |
 | Schema evolution orphans history rows | Records carry their own shape; readers get the shape as written |
 
@@ -380,6 +471,14 @@ From practitioner reports of hand-rolled systems:
    thing under test. Whether the contract should *require* nanosecond fidelity —
    forcing a second column, or a different storage type — is open; nothing in
    the temporal semantics needs it, and no adapter would enjoy it.
+   **Phase 3 found a third stakeholder:** the hash chain's canonical
+   serialization must commit to the *coarsest* resolution the storage contract
+   guarantees, or verification fails against exactly the stores it is meant to
+   protect. Canonical times are therefore microsecond-truncated, which means a
+   sub-microsecond edit to a caller-supplied valid time is invisible to the
+   chain — the same way it is invisible to a round trip through Postgres. If
+   the resolution contract ever tightens, the chain format version must bump
+   with it.
 7. **New, phase 2. Record IDs are unique across processes but no longer track
    transaction order across them.** An ID leads with the minting log's proposed
    transaction instant, and the store may assign a different one. Uniqueness is

@@ -30,15 +30,23 @@ and it needs a second axis.
   RFC 6901 JSON Pointer paths, exact number comparison. A codec failure is an
   error, never a silently empty diff.
 - **Required actor attribution.** No ambient default, no silent "system".
+- **A compliance layer that says what it is.** Retention schedules behind an
+  explicit sweeper with a dry run, legal holds with backdatable effective
+  instants that always beat retention, opt-in hash chaining with its threat
+  model stated rather than implied, and per-subject crypto-shredding with no
+  GDPR claim attached. Every design choice here traces to primary regulatory
+  text or is labelled as not required by any — see
+  [docs/COMPLIANCE.md](docs/COMPLIANCE.md).
 - **Zero dependencies.** Standard library only. Go 1.23+.
 
 ```go
 import "github.com/zkrebbekx/chronicle"
 ```
 
-> **Status: phase 2.** The core model, the in-memory store and the Postgres
-> adapter are in. The REST service and the retention / legal-hold /
-> tamper-evidence layer are later phases. See [docs/DESIGN.md](docs/DESIGN.md).
+> **Status: phase 3.** The core model, the in-memory store, the Postgres
+> adapter and the compliance layer — retention, legal hold, optional tamper
+> evidence, crypto-shredding — are in. The REST service is a later phase. See
+> [docs/DESIGN.md](docs/DESIGN.md).
 
 ## The question that justifies the library
 
@@ -288,6 +296,14 @@ It runs against `MemStore` and `pgstore` on every build, which is what keeps the
 two answering identically rather than merely plausibly. It needs no driver, so
 it lives in the dependency-free root module.
 
+The compliance capabilities have their own entry points, because they are
+optional extensions a store claims rather than part of the core contract:
+`chroniclefest.RunCompliance` holds a store to the `Deleter` and `HoldStore`
+contracts (all-or-nothing refusal of current records, retry-stable tombstones,
+backdatable `EffectiveFrom`, store-assigned `PlacedAt`, releases that keep the
+row), and `chroniclefest.RunKeyring` holds a `Keyring` to stable per-subject
+keys and terminal destruction.
+
 The suite reports through `chroniclefest.T`, a narrow interface `*testing.T`
 already satisfies, so it can also be driven by a harness that records failures
 instead of aborting. That is how the suite itself is tested: `chroniclefest`'s
@@ -343,9 +359,16 @@ bound, matching chronicle's zero-`time.Time` convention:
 pluggable `Codec`. A `jsonb` column would silently reject every non-JSON codec
 and turn a storage adapter into a codec mandate. The "query by changed field"
 path in DESIGN.md's open questions therefore needs a JSON *projection* — a
-generated column or a side table — rather than a change of primary storage, and
-that is phase 3 work. `meta` is `jsonb` because chronicle controls its shape
-entirely.
+generated column or a side table — rather than a change of primary storage.
+`meta` is `jsonb` because chronicle controls its shape entirely.
+
+The same `Migrate` also creates two derived tables: `<table>_holds` (legal
+holds, one row per hold forever, placement and release halves both
+attributed and both timestamped by the database) and `<table>_tombstones`
+(retained chain values of retention-deleted records, keyed on record ID so a
+retried deletion writes the same tombstone once). `pgstore.NewKeyring` manages
+its own `chronicle_keys` table separately — keys are a different trust
+decision from records, and its doc comment says so bluntly.
 
 ### Constraints and isolation callers inherit
 
@@ -402,9 +425,173 @@ DETAIL: EXCLUDE constraint on table "p" lacks column "tx_from" which is part of
         the partition key.
 ```
 
-Requirement 1 wins. The retention story in phase 3 needs a different mechanism —
-partitioning the *archive* rather than the live table, or accepting a per-partition
-constraint and enforcing cross-partition non-overlap another way.
+Requirement 1 wins. Phase 3's retention story therefore does not partition:
+the sweeper destroys eligible rows in place and the archive hook hands each
+batch to caller-owned storage first — which may itself be a partitioned
+archive table, since nothing constrains a table chronicle does not write
+through the exclusion constraint.
+
+## Retention
+
+Everything above preserves history; `retain` destroys it, on schedule, and the
+contradiction is deliberate. Data kept past its period is a liability its
+owner did not choose — but *which* kinds to sweep and after how long is a
+regulatory decision chronicle cannot make, so it refuses to: **no default
+retention period ships**, and a sweep with no explicit policy is an error. The
+commonly cited periods do not transplant the way vendors imply (HIPAA's six
+years attaches to written policies and procedures; the SOX-lineage seven years
+binds the external audit firm's workpapers — see
+[docs/COMPLIANCE.md](docs/COMPLIANCE.md)). Set the period your counsel
+advises.
+
+```go
+import "github.com/zkrebbekx/chronicle/retain"
+
+policies := []retain.Policy{{Kind: "employee", KeepFor: 7 * 365 * 24 * time.Hour}}
+
+plan, err := retain.Plan(ctx, store, policies, time.Now())    // dry run: reads only
+rep, err  := retain.Execute(ctx, store, policies, time.Now(),
+    retain.WithArchive(archiveBatch))                          // the real thing
+```
+
+What a sweep can destroy is narrow by construction:
+
+- **Only superseded records.** A record whose `TxTo` is open is current belief
+  and is never eligible, at any age. This is enforced twice — the sweeper
+  never names one, and the store's `Delete` refuses whole batches containing
+  one (`ErrCurrentRecord`).
+- **Aged from supersession.** `KeepFor` runs from `TxTo` — how long the record
+  has been dead — not from `TxFrom`. Aging from the write instant would
+  destroy a record that stopped being current belief yesterday.
+- **Never a held record.** Records matched by an active legal hold are
+  withheld, always, with no override, and the `Report` lists each withheld
+  record and the hold that saved it.
+
+`WithArchive` runs your archival — an archive table, an object store — on each
+batch *before* it is destroyed, and an error aborts the batch untouched. The
+hook **must be idempotent**: no transaction can span your archive and the
+store's deletion, so a sweep that fails between the two will re-archive the
+same records on retry. Key the archive on record ID and upsert.
+
+Deletion itself is a store *capability* — the optional `Deleter` extension,
+implemented by `MemStore` and `pgstore` — so the core `Store` contract stays
+destruction-free and existing third-party stores keep compiling.
+
+## Legal hold
+
+A hold suspends retention for everything in its scope. It restrains
+destruction only — writes proceed as ever, because a log that stopped
+recording under litigation would be destroying evidence of the present.
+
+```go
+hs := store.(chronicle.HoldStore)
+hs.PlaceHold(ctx, chronicle.Hold{
+    ID:            "matter-2026-014",
+    Kind:          "employee",
+    EffectiveFrom: lastMarch, // backdated, deliberately
+    Reason:        "anticipated litigation",
+    PlacedBy:      counsel,
+})
+// ... later ...
+hs.ReleaseHold(ctx, "matter-2026-014", counsel, "matter settled")
+```
+
+`EffectiveFrom` **may be backdated**, and that is a requirement rather than a
+loophole: FRCP 37(e) attaches the preservation duty on "anticipation or
+conduct of litigation", judged after the fact by a court — not on complaint
+filing — so an operator has to be able to assert, honestly and late, "our duty
+attached last month". Two things backdating is not: it cannot resurrect
+records destroyed before the hold was placed, and it never filters *which*
+records the hold protects — an active hold withholds everything in scope
+whatever the records' own timestamps, because the duty covers relevant
+information however old it is.
+
+The hold is itself a record: `PlacedAt` and `ReleasedAt` are store-assigned
+(a control whose timeline its operator could write would prove nothing),
+release fills in the releasing actor and keeps the row forever, and releasing
+twice is an error rather than a rewrite of the first release's attribution.
+
+## Tamper evidence
+
+Off by default. `chronicle.WithChaining()` links every record of an entity
+into a SHA-256 hash chain — each record's chain value covers a canonical
+serialization of its immutable fields plus its predecessor's value, carried in
+reserved record metadata so no store needs schema for it.
+
+```go
+log := chronicle.NewLog(store, chronicle.WithChaining())
+
+rep, err := log.Verify(ctx, "employee", "alice") // recompute; first divergence, if any
+head, err := log.ChainHead(ctx, "employee", "alice") // the value to anchor externally
+```
+
+**The honest threat model, which is the reason this is opt-in and last:** a
+hash chain detects retrospective edits by someone who does **not** control the
+chain head. It does nothing against an administrator who owns the database and
+can recompute every hash. Only anchoring heads outside the database changes
+that — `ChainHead` exists so you can — and chronicle ships no anchoring, so it
+claims nothing anchoring would be needed for. No regulation surveyed in
+[docs/COMPLIANCE.md](docs/COMPLIANCE.md) requires any of this.
+
+Retention composes with chaining through **tombstones**: deleting a chained
+record retains its chain value, `Verify` passes over the gap and reports how
+many tombstones it crossed. Be precise about what that proves. A verified
+chain across a gap establishes that the survivors are what the head commits
+to and that a record with the recorded chain value stood in the gap — it
+cannot establish *why* the record was destroyed, because a store writes
+tombstones for whatever it is asked to delete, and within a run of consecutive
+tombstones only the last is constrained by a surviving successor. A tombstone
+is evidence of destruction, not of authorisation; telling those apart needs
+anchored heads and sweep reports kept where the database administrator cannot
+edit them.
+
+Two documented edges: canonical timestamps are microsecond-truncated (the
+storage contract's floor, set by Postgres `timestamptz`), so sub-microsecond
+edits to valid times are outside the chain; and `TxTo` cannot be hash-covered
+(it is written later, at supersession), so `Verify` instead pins every
+superseded record's `TxTo` to the transaction starts of later chained writes —
+which detects a shifted `TxTo` but not one moved to a *different* chained
+write's instant. The canonical form is versioned (`v1:`), so a future format
+meets an explicit unknown-version divergence rather than a silent mismatch.
+
+## Crypto-shredding
+
+chronicle supports per-subject encryption keys. Destroying a key renders that
+subject's historical values unrecoverable while preserving the record
+structure. **Whether key destruction constitutes erasure under GDPR Art.17
+depends on your supervisory authority's position; chronicle makes no
+compliance claim.** No DPA decision, EDPB guidance or court ruling accepting
+it was verified by the research behind
+[docs/COMPLIANCE.md](docs/COMPLIANCE.md) — if you need a settled answer, get
+it from counsel, not from a library README.
+
+```go
+log := chronicle.NewLog(store, chronicle.WithKeyring(keyring))
+
+log.Put(ctx, "employee", "alice", data, march, time.Time{}, hr,
+    chronicle.WithSubject("subj-42"))     // stored encrypted under subj-42's key
+
+keyring.DestroyKey(ctx, "subj-42")        // terminal: no re-minting, ever
+log.Get(ctx, "employee", "alice", now)    // ErrShredded — never garbage plaintext
+```
+
+Data is AES-256-GCM under a per-subject key from a pluggable `Keyring`, with
+the record's kind and entity as authenticated data so ciphertext cannot be
+replayed onto another entity. `Get` and `Diff` decrypt transparently and fail
+with `ErrShredded` once the key is gone; `History`, `Timeline` and `Query`
+return the log as stored — structure intact, ciphertext and markers visible —
+with `Log.Decrypt` as the explicit step, so shredding a subject never breaks
+the audit trail around them. Under chaining the hash covers the ciphertext,
+so destroying a key changes no hash and breaks no chain.
+
+The keyring is the whole strength of the scheme: shredding assumes destroying
+a key destroys *every copy*. `MemKeyring` is for tests; `pgstore.NewKeyring`
+stores keys in a Postgres table, which means one backup cycle and one
+administrator for keys and ciphertext alike — read its doc comment before
+relying on it, and back the `Keyring` interface with a KMS or HSM where
+shredding has to withstand your own infrastructure. Subject identifiers are
+stored in clear and survive shredding; make them pseudonymous references, not
+the personal data they protect.
 
 ## Compliance, honestly
 
@@ -432,6 +619,13 @@ Consequences visible in this API:
   parties or other objects — HIPAA's six years attaches to written policies
   (45 CFR 164.316(b)(1)), and the SOX-lineage seven years binds the external
   audit firm (PCAOB AS 1215 .14, SEC Rule 2-06). 21 CFR 11.10(e) is *relative*.
+- **Legal holds accept a backdated effective instant.** FRCP 37(e)'s trigger
+  is anticipation of litigation, judged after the fact — not complaint filing.
+- **Hash chaining is opt-in and claims only its real threat model.** No
+  regulation surveyed requires cryptographic tamper evidence; the genuine bar
+  is non-destructive, which full-row versioning meets with no hashing at all.
+- **Crypto-shredding is described as a mechanism, not as GDPR erasure.** The
+  legal characterization is unverified and stays hedged.
 
 chronicle is a library; compliance is a property of your whole system. This is
 not legal advice.
@@ -446,11 +640,12 @@ not legal advice.
   of domain commands to fold.
 - **No ORM, ever.** That is the specific unoccupied axis, and the reason every
   incumbent is unusable outside its own framework.
-- **No tamper-evidence claims.** A hash chain detects retrospective edits by
-  someone who does not control the chain head. It does nothing against an
-  administrator who owns the database and can recompute it. Only external
-  anchoring changes that, and chronicle does not ship anchoring, so it will not
-  imply the stronger guarantee.
+- **No tamper-proof claims.** chronicle ships hash chaining, opt-in, and states
+  exactly what it detects: retrospective edits by someone who does not control
+  the chain head. It does nothing against an administrator who owns the
+  database and can recompute it. Only external anchoring changes that, and
+  chronicle does not ship anchoring, so it will not imply the stronger
+  guarantee.
 
 ## License
 

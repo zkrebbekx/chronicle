@@ -158,14 +158,44 @@
 // re-splits and tries again, up to [DefaultWriteRetries] times — see
 // [WithWriteRetries].
 //
+// # Compliance
+//
+// Three optional layers sit on the core, each stating exactly what it does
+// and claiming nothing more — see docs/COMPLIANCE.md for the primary-text
+// research behind every choice.
+//
+// Legal holds ([Hold], [HoldStore]) restrain retention destruction for scoped
+// records. A hold's EffectiveFrom may be backdated, deliberately: FRCP
+// 37(e)'s preservation duty attaches on anticipation of litigation, judged
+// after the fact. Retention itself lives in the retain subpackage, behind an
+// explicit sweeper with a first-class dry run; nothing in this package
+// deletes implicitly, and the [Deleter] capability refuses to destroy current
+// belief at all.
+//
+// Tamper evidence ([WithChaining], [Log.Verify], [Log.ChainHead]) is an
+// opt-in per-entity hash chain. Its threat model is stated on the option
+// rather than implied: it detects retrospective edits by someone who does not
+// control the chain head, and nothing more. Retention under a chain leaves
+// [Tombstone] values so verification crosses the gap.
+//
+// Crypto-shredding ([WithKeyring], [WithSubject], [Keyring]) encrypts a
+// record's data under a per-subject key; destroying the key renders those
+// values unrecoverable while the records' structure survives. Whether that
+// constitutes erasure under GDPR Art.17 depends on your supervisory
+// authority's position; chronicle makes no compliance claim.
+//
 // # Errors
 //
 // Match errors with [errors.Is] against [ErrNotFound], [ErrInvalidInterval],
 // [ErrMissingActor], [ErrUnknownKind], [ErrCodec], [ErrInvalidCursor],
-// [ErrMissingEntityID], [ErrClosed] and [ErrConflict]. Where extra context
-// helps, the concrete error is also available via [errors.As]:
-// [*IntervalError], [*KindError], [*CodecError], [*NotFoundError],
-// [*CursorError] and [*ConflictError].
+// [ErrMissingEntityID], [ErrClosed], [ErrConflict], and the compliance
+// layer's [ErrMissingHoldID], [ErrHoldExists], [ErrHoldReleased],
+// [ErrCurrentRecord], [ErrNoChain], [ErrReservedMeta], [ErrShredded],
+// [ErrKeyDestroyed] and [ErrNoKeyring]. Where extra context helps, the
+// concrete error is also available via [errors.As]: [*IntervalError],
+// [*KindError], [*CodecError], [*NotFoundError], [*CursorError],
+// [*ConflictError], [*HoldError], [*DeleteError], [*ChainError], [*KeyError]
+// and [*ShredError].
 //
 // # Concurrency
 //
@@ -182,8 +212,9 @@
 // framework, since chronicle records what an entity was rather than a stream
 // of commands to fold.
 //
-// Retention policies, legal hold, tamper-evidence and the Postgres adapter are
-// deliberately absent; see docs/DESIGN.md for the roadmap and
+// The Postgres adapter lives in the pgstore submodule and the retention
+// sweeper in the retain subpackage, keeping this package dependency-free and
+// destruction-free respectively. See docs/DESIGN.md for the design record and
 // docs/COMPLIANCE.md for what regulation actually requires, which is
 // considerably less than most audit-log vendors claim.
 package chronicle

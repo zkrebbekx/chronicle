@@ -176,6 +176,12 @@ func Plan(ctx context.Context, store chronicle.Store, policies []Policy, now tim
 // it. A store without the capability cannot contain holds — placing one is
 // the only way in — so its absence means there is genuinely nothing to
 // honour, not that holds were skipped.
+//
+// now is compared against transaction instants the store assigned, so it
+// should come from the same clock authority — for a database-backed store,
+// the database's. In practice retention periods are months or years and dwarf
+// any clock skew; it matters only when KeepFor approaches the skew between
+// the sweeping process's clock and the store's.
 func Execute(ctx context.Context, store chronicle.Store, policies []Policy, now time.Time, opts ...Option) (Report, error) {
 	s := sweeper{store: store, batch: DefaultBatchSize}
 	for _, opt := range opts {
