@@ -57,6 +57,56 @@ var (
 	// only surfaces the error if it keeps losing. Callers who drive a store
 	// directly should do the same.
 	ErrConflict = errors.New("chronicle: write conflict")
+
+	// ErrMissingHoldID is returned when a legal hold is placed without an ID.
+	// Errors wrapping it are always a [*HoldError].
+	ErrMissingHoldID = errors.New("chronicle: hold ID required")
+
+	// ErrHoldExists is returned when a hold is placed under an ID that already
+	// exists. Holds are not upsertable; see [HoldStore.PlaceHold].
+	ErrHoldExists = errors.New("chronicle: hold already exists")
+
+	// ErrHoldReleased is returned when a hold that has already been released
+	// is released again. A second release would rewrite or silently discard
+	// the first release's attribution; see [HoldStore.ReleaseHold].
+	ErrHoldReleased = errors.New("chronicle: hold already released")
+
+	// ErrCurrentRecord is returned by [Deleter.Delete] when a deletion names a
+	// record that is still current belief. Nothing is deleted. Retention trims
+	// history; it must never change the present. Errors wrapping it are always
+	// a [*DeleteError] naming the record.
+	ErrCurrentRecord = errors.New("chronicle: record is current belief")
+
+	// ErrNoChain is returned by [Log.Verify] and [Log.ChainHead] when the
+	// entity has no chained records and no tombstones — there is nothing to
+	// verify, which must not be mistaken for a verification that passed.
+	ErrNoChain = errors.New("chronicle: no hash chain")
+
+	// ErrReservedMeta is returned by every write path when caller-supplied
+	// metadata uses a key in chronicle's reserved namespace — any key starting
+	// with [MetaReservedPrefix]. chronicle stores its own bookkeeping (chain
+	// hashes, encryption markers) in Meta under that prefix, and a caller who
+	// could write those keys could forge exactly what they exist to attest.
+	ErrReservedMeta = errors.New("chronicle: reserved metadata key")
+
+	// ErrShredded is returned when a record's data was encrypted under a
+	// per-subject key that is no longer available — usually because
+	// [Keyring.DestroyKey] destroyed it. The record's structure survives; its
+	// value does not, and chronicle fails rather than hand back ciphertext
+	// where plaintext was asked for. Errors wrapping it are always a
+	// [*ShredError].
+	ErrShredded = errors.New("chronicle: data shredded")
+
+	// ErrKeyDestroyed is returned by a [Keyring] for a subject whose key has
+	// been destroyed. Destruction is terminal: the keyring will not mint a
+	// replacement under the same subject, since a quietly re-minted key would
+	// make new writes readable under an identifier the caller believes erased.
+	ErrKeyDestroyed = errors.New("chronicle: subject key destroyed")
+
+	// ErrNoKeyring is returned when an operation needs a subject key and the
+	// log has no [Keyring] configured — writing with [WithSubject], or reading
+	// a record whose data is encrypted.
+	ErrNoKeyring = errors.New("chronicle: no keyring configured")
 )
 
 // IntervalError reports a malformed interval, carrying the offending bounds so
@@ -166,6 +216,111 @@ func (e *ConflictError) Is(target error) bool { return target == ErrConflict }
 func conflictf(format string, args ...any) error {
 	return &ConflictError{Reason: fmt.Sprintf(format, args...)}
 }
+
+// HoldError reports a failed legal-hold operation, carrying the hold's ID.
+type HoldError struct {
+	// ID is the hold involved, empty when the caller supplied none.
+	ID string
+	// Err is the wrapped sentinel: [ErrMissingHoldID], [ErrMissingActor],
+	// [ErrHoldExists], [ErrHoldReleased] or [ErrNotFound].
+	Err error
+}
+
+// Error implements the error interface.
+func (e *HoldError) Error() string {
+	if e.ID == "" {
+		return "chronicle: hold: " + e.Err.Error()
+	}
+	return fmt.Sprintf("chronicle: hold %q: %v", e.ID, e.Err)
+}
+
+// Unwrap returns the wrapped sentinel so [errors.Is] matches.
+func (e *HoldError) Unwrap() error { return e.Err }
+
+// DeleteError reports a refused deletion, naming the record that caused the
+// refusal. It wraps [ErrCurrentRecord].
+type DeleteError struct {
+	// RecordID names the record the deletion was refused over.
+	RecordID RecordID
+	// Err is the wrapped sentinel.
+	Err error
+}
+
+// Error implements the error interface.
+func (e *DeleteError) Error() string {
+	return fmt.Sprintf("chronicle: delete %s: %v", e.RecordID, e.Err)
+}
+
+// Unwrap returns the wrapped sentinel so [errors.Is] matches.
+func (e *DeleteError) Unwrap() error { return e.Err }
+
+// ChainError reports a chain operation that could not run, carrying the
+// entity involved. It wraps [ErrNoChain], or a store failure.
+type ChainError struct {
+	// Kind and EntityID identify the entity.
+	Kind, EntityID string
+	// Err is the wrapped error.
+	Err error
+}
+
+// Error implements the error interface.
+func (e *ChainError) Error() string {
+	return fmt.Sprintf("chronicle: chain %s/%s: %v", e.Kind, e.EntityID, e.Err)
+}
+
+// Unwrap returns the wrapped error so [errors.Is] matches.
+func (e *ChainError) Unwrap() error { return e.Err }
+
+// KeyError reports a keyring failure, carrying the subject involved.
+type KeyError struct {
+	// Subject is the subject whose key was involved.
+	Subject string
+	// Err is the wrapped error: [ErrKeyDestroyed], [ErrNoKeyring], or a
+	// keyring's own failure.
+	Err error
+}
+
+// Error implements the error interface.
+func (e *KeyError) Error() string {
+	return fmt.Sprintf("chronicle: key for subject %q: %v", e.Subject, e.Err)
+}
+
+// Unwrap returns the wrapped error so [errors.Is] matches.
+func (e *KeyError) Unwrap() error { return e.Err }
+
+// ShredError reports that a record's encrypted data could not be recovered.
+// It wraps [ErrShredded] — always — and additionally whatever underlying
+// error the keyring or cipher reported.
+type ShredError struct {
+	// Subject is the subject whose key the data was encrypted under.
+	Subject string
+	// RecordID identifies the unrecoverable record, when known.
+	RecordID RecordID
+	// Reason says why recovery failed, when the cause is more specific than
+	// the wrapped error.
+	Reason string
+	// Err is the underlying failure, when there was one.
+	Err error
+}
+
+// Error implements the error interface.
+func (e *ShredError) Error() string {
+	msg := fmt.Sprintf("chronicle: record %s: data for subject %q is unrecoverable", e.RecordID, e.Subject)
+	if e.Reason != "" {
+		msg += ": " + e.Reason
+	}
+	if e.Err != nil {
+		msg += ": " + e.Err.Error()
+	}
+	return msg
+}
+
+// Unwrap returns the underlying failure, when there was one.
+func (e *ShredError) Unwrap() error { return e.Err }
+
+// Is reports that a ShredError matches [ErrShredded], in addition to whatever
+// the wrapped error matches.
+func (e *ShredError) Is(target error) bool { return target == ErrShredded }
 
 // NotFoundError reports that no record satisfied a lookup, carrying the
 // coordinates that were searched. It wraps [ErrNotFound].

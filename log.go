@@ -5,6 +5,7 @@ import (
 	cryptorand "crypto/rand"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"maps"
 	"math/rand/v2"
 	"strconv"
@@ -60,6 +61,8 @@ type Log struct {
 	kinds   map[string]struct{}
 	node    string
 	retries int
+	chain   bool
+	keyring Keyring
 
 	mu     sync.RWMutex // guards lastTx and seq; held across the whole write path
 	lastTx time.Time
@@ -181,8 +184,9 @@ func (l *Log) Codec() Codec { return l.codec }
 type WriteOption func(*writeOpts)
 
 type writeOpts struct {
-	reason string
-	meta   map[string]string
+	reason  string
+	meta    map[string]string
+	subject string
 }
 
 // WithReason attaches a free-text business justification.
@@ -321,6 +325,17 @@ func (l *Log) write(ctx context.Context, kind, entityID string, data []byte, val
 	for _, opt := range opts {
 		opt(&o)
 	}
+	for k := range o.meta {
+		if strings.HasPrefix(k, MetaReservedPrefix) {
+			return Result{}, fmt.Errorf("chronicle: metadata key %q: %w", k, ErrReservedMeta)
+		}
+	}
+	if o.subject != "" {
+		var err error
+		if data, err = l.sealForSubject(ctx, &o, kind, entityID, data); err != nil {
+			return Result{}, err
+		}
+	}
 
 	// The log's write lock keeps this process's writes to any entity in a
 	// single file, which is what makes the sequence numbers in record IDs
@@ -385,6 +400,34 @@ func sleepBackoff(ctx context.Context, attempt int) error {
 	}
 }
 
+// sealForSubject encrypts a write's data under the subject's key and stamps
+// the encryption markers into the write's metadata. The markers live in Meta
+// so that no store needs schema for them, and they are what the read path
+// recognises an encrypted record by.
+func (l *Log) sealForSubject(ctx context.Context, o *writeOpts, kind, entityID string, data []byte) ([]byte, error) {
+	if l.keyring == nil {
+		return nil, &KeyError{Subject: o.subject, Err: ErrNoKeyring}
+	}
+	key, err := l.keyring.Key(ctx, o.subject)
+	if err != nil {
+		var ke *KeyError
+		if errors.As(err, &ke) {
+			return nil, err
+		}
+		return nil, &KeyError{Subject: o.subject, Err: err}
+	}
+	sealed, err := sealData(key, data, kind, entityID)
+	if err != nil {
+		return nil, err
+	}
+	if o.meta == nil {
+		o.meta = make(map[string]string, 2)
+	}
+	o.meta[MetaSubject] = o.subject
+	o.meta[MetaCipher] = CipherAESGCM1
+	return sealed, nil
+}
+
 // attemptLocked is one pass of the write: hand the store a plan, let it read
 // the overlapping records under its own lock, compute the split against what
 // it read, and apply the result in the same transaction.
@@ -396,11 +439,31 @@ func sleepBackoff(ctx context.Context, attempt int) error {
 func (l *Log) attemptLocked(ctx context.Context, kind, entityID string, data []byte, valid Interval, actor Actor, intent Intent, o writeOpts) (Result, error) {
 	txNow := l.tickLocked()
 
+	// Under chaining the plan asks for every current record, not only the
+	// overlapping ones: the chain tail — the record the new links hash from —
+	// is the greatest current record in chronicle's total order, and it may
+	// well not overlap the interval being written. The planner then narrows to
+	// the genuinely overlapping records itself before splitting.
+	planValid := valid
+	if l.chain {
+		planValid = Always()
+	}
+
 	var (
 		inserts    []Record
 		superseded []RecordID
 	)
-	plan := func(overlapping []Record, txAt time.Time) (Write, error) {
+	plan := func(current []Record, txAt time.Time) (Write, error) {
+		overlapping := current
+		if l.chain {
+			overlapping = overlapping[:0:0]
+			for _, r := range current {
+				if r.Valid().Overlaps(valid) {
+					overlapping = append(overlapping, r)
+				}
+			}
+		}
+
 		// Record IDs lead with the transaction instant, so they are minted
 		// here, against the instant the store settled on, rather than against
 		// the one this log proposed.
@@ -434,12 +497,15 @@ func (l *Log) attemptLocked(ctx context.Context, kind, entityID string, data []b
 				inserts = append(inserts, l.remainderLocked(r, Interval{From: valid.To, To: r.ValidTo}, txAt))
 			}
 		}
+		if l.chain {
+			chainStamp(kind, entityID, current, inserts)
+		}
 		return Write{Supersede: superseded, Insert: inserts}, nil
 	}
 
 	txAt, err := l.store.Apply(ctx, ApplyRequest{
 		Entity: EntityRef{Kind: kind, EntityID: entityID},
-		Valid:  valid,
+		Valid:  planValid,
 		TxAt:   txNow,
 		Plan:   plan,
 	})

@@ -25,6 +25,9 @@ type MemStore struct {
 	recs    []Record
 	byID    map[RecordID]int
 	byEntry map[entityKey][]int
+	tombs   map[entityKey][]Tombstone
+	holds   []Hold
+	holdIdx map[string]int
 	closed  bool
 }
 
@@ -37,6 +40,8 @@ func NewMemStore() *MemStore {
 	return &MemStore{
 		byID:    make(map[RecordID]int),
 		byEntry: make(map[entityKey][]int),
+		tombs:   make(map[entityKey][]Tombstone),
+		holdIdx: make(map[string]int),
 	}
 }
 
@@ -57,6 +62,9 @@ func (s *MemStore) Close() error {
 	s.recs = nil
 	s.byID = nil
 	s.byEntry = nil
+	s.tombs = nil
+	s.holds = nil
+	s.holdIdx = nil
 	return nil
 }
 

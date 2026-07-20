@@ -76,12 +76,19 @@ func (l *Log) Get(ctx context.Context, kind, entityID string, as As) (*Record, e
 		return nil, ErrMissingEntityID
 	}
 	as = as.resolve(l.now())
-	return l.store.Get(ctx, GetQuery{
+	rec, err := l.store.Get(ctx, GetQuery{
 		Kind:     kind,
 		EntityID: entityID,
 		ValidAt:  as.ValidAt,
 		TxAt:     as.TxAt,
 	})
+	if err != nil {
+		return nil, err
+	}
+	// Get answers "what was the state", so an encrypted record is decrypted —
+	// and a shredded one is a loud [*ShredError], never returned ciphertext.
+	// History, Timeline and Query return records as stored; see [Log.Decrypt].
+	return l.decryptRecord(ctx, rec)
 }
 
 // HistoryOption filters [Log.History].
@@ -321,7 +328,11 @@ func (l *Log) getOrNil(ctx context.Context, kind, entityID string, as As) (*Reco
 		}
 		return nil, err
 	}
-	return rec, nil
+	// Diff compares states, so its operands are decrypted like [Log.Get]'s
+	// result. A shredded operand fails the whole diff: reporting "no changes"
+	// against ciphertext would be under-reporting, the one failure mode a
+	// change log must not have.
+	return l.decryptRecord(ctx, rec)
 }
 
 // decode turns a record into comparable values. A nil record decodes to an
