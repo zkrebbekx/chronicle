@@ -1,0 +1,41 @@
+# One-command demo: Postgres plus chronicled, migrated on boot, chaining on.
+#
+#   cd chronicled && docker compose up --build
+#
+# Then talk to http://localhost:8080 with the demo tokens below. The tokens
+# are demonstration values baked into a public file — replace them before
+# anything that is not a demo.
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: chronicle
+      POSTGRES_PASSWORD: chronicle
+      POSTGRES_DB: chronicle
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U chronicle -d chronicle"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+
+  chronicled:
+    build:
+      # The repository root: the nested module needs its siblings.
+      context: ..
+      dockerfile: chronicled/Dockerfile
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
+    environment:
+      CHRONICLED_DSN: postgres://chronicle:chronicle@postgres:5432/chronicle?sslmode=disable
+      # Demo convenience; in production run migrations explicitly and leave
+      # this unset.
+      CHRONICLED_MIGRATE: "true"
+      CHRONICLED_CHAINING: "on"
+      CHRONICLED_TOKENS: >-
+        [{"token":"demo-writer-token","role":"writer",
+          "actor":{"id":"svc-payroll","type":"service","name":"Payroll Service"}},
+         {"token":"demo-admin-token","role":"admin",
+          "actor":{"id":"u-compliance","type":"user","name":"Compliance Officer"}}]
