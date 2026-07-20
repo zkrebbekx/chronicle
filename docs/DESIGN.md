@@ -133,7 +133,7 @@ the reason every incumbent is unusable outside its own framework.
 
 ```
 type Store interface {
-    Apply(ctx context.Context, w Write) (time.Time, error) // atomic supersede + insert
+    Apply(ctx context.Context, req ApplyRequest) (time.Time, error) // plan + apply, atomically
     Get(ctx context.Context, q GetQuery) (*Record, error)
     Query(ctx context.Context, q Query) ([]Record, Cursor, error)
 }
@@ -169,7 +169,27 @@ otherwise do badly itself:
 - exclusion constraints (`btree_gist`) to make overlapping valid intervals for
   the same entity *structurally impossible* rather than merely checked in
   application code — but see the deferrability requirement below
-- partitioning on transaction time for the retention/archival story
+- ~~partitioning on transaction time for the retention/archival story~~
+
+**Correction, found during phase 2: partitioning on transaction time is
+incompatible with the exclusion constraint, and the constraint wins.** Postgres
+requires every unique or exclusion constraint on a partitioned table to include
+the partition key with equality, and `tx_from WITH =` is meaningless for a
+non-overlap constraint — two current records for one entity would be free to
+overlap as long as they landed in different partitions. Verified against
+PostgreSQL 17.10:
+
+```
+ERROR:  unique constraint on partitioned table must include all partitioning columns
+DETAIL: EXCLUDE constraint on table "p" lacks column "tx_from" which is part of
+        the partition key.
+```
+
+These are the two headline storage claims and they cannot both be true of one
+table. Phase 3 has to pick a different mechanism: partition an *archive* table
+rather than the live one, or accept per-partition constraints and enforce
+cross-partition non-overlap some other way. Retention was already phase 3; this
+just means it is a harder phase 3 than the design assumed.
 
 Three requirements the adapter must satisfy. All three were found in phase 1
 review, and all three are correctness issues rather than tuning choices:
@@ -179,6 +199,19 @@ review, and all three are correctness issues rather than tuning choices:
    passes through an intermediate state where the superseded record is not yet
    closed and its replacement is already inserted. A non-deferred constraint
    rejects ordinary correct writes.
+
+   **Refinement, found during phase 2.** The premise is conditional on
+   statement order, and the order is the adapter's to choose. Closing the
+   superseded records *before* inserting their replacements never passes
+   through an overlapping state at all, and the shipped adapter does exactly
+   that — so a per-statement check would accept every write chronicle makes.
+   The requirement is kept, because it costs nothing and it is the only thing
+   that keeps the constraint correct under *any* statement order, including a
+   future one that batches several writes into one transaction. But the
+   justification as stated is not why the shipped code needs it, and a test
+   that drove `Apply` and watched it succeed would have proved nothing. The
+   deferral is therefore tested through raw SQL in the insert-first order, both
+   with the constraint deferred and with it made immediate.
 2. **The read-modify-write needs real isolation.** chronicle scans the
    overlapping records *before* computing the split. Two concurrent writers to
    one entity can both observe the same pre-state and each split it, producing
@@ -195,14 +228,33 @@ review, and all three are correctness issues rather than tuning choices:
    begins, so the lock is taken after the decision it was meant to guard.
 
    The hazard is not a weak isolation level; it is a read-modify-write split
-   across two store calls, which no isolation level can span. The adapter
-   therefore (a) takes a per-entity advisory lock for the duration of `Apply`
-   so writers to one entity queue rather than race, (b) re-checks inside that
-   transaction that every record it means to supersede is still current, and
-   (c) leans on the deferred exclusion constraint to catch anything (b) missed.
-   A stale plan becomes `ErrConflict`, and the log re-reads and re-splits.
-   Retry belongs above the store because only the log knows how to recompute
-   the split.
+   across two store calls, which no isolation level can span.
+
+   **Detect-and-retry was tried first, and it starves.** Keeping the two-call
+   shape and having the adapter take a per-entity advisory lock, re-check the
+   supersession targets inside its transaction, and report `ErrConflict` for a
+   stale plan is *correct* — the invariant held under every test. It is also
+   unusable: the writer that waits on the lock always finds its plan stale by
+   the time it gets in, while the writer that never waits never conflicts, so
+   the loser loses every round. Measured against two processes writing one
+   entity: one writer landed 40 of 40 writes and the other landed **0 of 40**,
+   reproducibly. Retrying and backing off make it worse, because they give the
+   winner a longer head start.
+
+   **The fix is to move the read inside the lock**, which means `Apply` takes a
+   plan rather than a finished write:
+
+   ```
+   Apply(ctx, ApplyRequest{Entity, Valid, TxAt, Plan})
+   Plan func(current []Record, txAt time.Time) (Write, error)
+   ```
+
+   The store locks the entity, reads its current overlapping records `FOR
+   UPDATE`, calls the plan, and applies the result — one transaction, one lock,
+   no window. chronicle's temporal reasoning still lives above the store, which
+   never learns what a remainder is; it just runs where the store can protect
+   it. `ErrConflict` and the retry loop survive for `StaticWrite`, which is not
+   planned from the store's own read and so can still be stale.
 3. **Transaction time should be assigned database-side** — a sequence, or
    `clock_timestamp()` inside a serializable transaction — rather than by the
    Go process. The in-memory implementation ratchets tx time forward per `Log`,
@@ -291,8 +343,15 @@ From practitioner reports of hand-rolled systems:
 
 1. Codec — JSON first. `Data []byte` keeps it pluggable, but the *query by
    changed field* path needs structured access, so Postgres `jsonb` is the
-   likely concrete floor. **Still open**, and deferred out of phase 1 for that
-   reason: it cannot be done efficiently in a memory store.
+   likely concrete floor. **Narrowed in phase 2, still open.** `jsonb` cannot
+   be the storage type for `Data`: `Record.Data` is opaque bytes under a
+   pluggable `Codec`, and a `jsonb` column would reject every non-JSON codec
+   outright — turning a storage adapter into a codec mandate. The adapter
+   stores `data bytea` and keeps `Codec` meaning what it says. Query-by-changed-
+   field therefore needs a JSON *projection* alongside the authoritative bytes —
+   a generated column guarded by a check, or a side table — rather than a change
+   of primary storage. `Meta` is `jsonb`, because chronicle controls its shape
+   entirely and a GIN index over it is one statement away.
 2. ~~Does `Correct` need to be storage-distinct from `Put`?~~ **Answered:** no.
    An `Intent` flag on the record is sufficient and shipped.
 3. ~~Non-overlap on the transaction axis?~~ **Answered, with a precondition.**
@@ -307,8 +366,27 @@ From practitioner reports of hand-rolled systems:
    compare by position**, so inserting at the head reports every later element
    as modified. An LCS or identity-field heuristic guesses at caller intent;
    a stated rule is more honest.
-5. **New.** Remainder records carry the *superseded* record's actor, reason and
+5. Remainder records carry the *superseded* record's actor, reason and
    meta, not the splitting writer's — otherwise the log would claim someone
    asserted data they never sent. Attribution is not lost: remainders share
    `TxFrom` with the write that caused them, so the assert/correct record at
    that instant identifies who split it.
+6. **New, phase 2. Timestamp resolution is not uniform across stores.**
+   Postgres `timestamptz` holds microseconds; Go's `time.Time` holds
+   nanoseconds. Transaction time is assigned by the database and so is already
+   microsecond-aligned, but caller-supplied *valid* times are truncated on the
+   way in, and round-trip equality holds only to the microsecond. The
+   conformance suite works in whole seconds so that resolution is never the
+   thing under test. Whether the contract should *require* nanosecond fidelity —
+   forcing a second column, or a different storage type — is open; nothing in
+   the temporal semantics needs it, and no adapter would enjoy it.
+7. **New, phase 2. Record IDs are unique across processes but no longer track
+   transaction order across them.** An ID leads with the minting log's proposed
+   transaction instant, and the store may assign a different one. Uniqueness is
+   guaranteed by a per-log random token — without it two processes could mint
+   the same ID and a primary key would silently swallow one of two concurrent
+   writes. Ordering by ID is only used as the final tiebreak between records
+   that already share a transaction instant and a valid start, which in
+   practice means records written together, so a within-log ordering suffices.
+   Documented on `RecordID`; worth revisiting if IDs ever become a public sort
+   key rather than an internal tiebreak.

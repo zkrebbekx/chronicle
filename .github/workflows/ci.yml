@@ -35,9 +35,89 @@ jobs:
         working-directory: ${{ matrix.module }}
         run: go test -race -timeout 60s ./...
 
-  lint:
-    name: lint
+  # pgstore is a separate job rather than a matrix entry because it is the only
+  # module that needs a database, and adding a service container to the matrix
+  # would start Postgres for the two modules that do not.
+  pgstore:
+    name: test (pgstore, go ${{ matrix.go }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        go: ["1.23", "1.24", "1.25"]
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: chronicle
+          POSTGRES_PASSWORD: chronicle
+          POSTGRES_DB: chronicle
+        ports:
+          - 5432:5432
+        # Without the health check the job races the container's startup and
+        # fails intermittently on a cold runner.
+        options: >-
+          --health-cmd "pg_isready -U chronicle -d chronicle"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
+        with:
+          go-version: ${{ matrix.go }}
+          cache: true
+          # pgstore has a go.sum: the driver is a test dependency of this
+          # module only. The root has none and must keep none.
+          cache-dependency-path: pgstore/go.sum
+      - name: Create btree_gist
+        # The extension needs a role permitted to create it. Migrate issues the
+        # CREATE EXTENSION itself, but doing it once here keeps the tests
+        # honest about what they need rather than relying on the CI role being
+        # a superuser by accident.
+        env:
+          PGPASSWORD: chronicle
+        run: psql -h localhost -U chronicle -d chronicle -c 'CREATE EXTENSION IF NOT EXISTS btree_gist'
+      - name: Test
+        working-directory: pgstore
+        env:
+          CHRONICLE_TEST_DSN: postgres://chronicle:chronicle@localhost:5432/chronicle?sslmode=disable
+        run: go test -race -timeout 300s ./...
+      - name: Coverage
+        working-directory: pgstore
+        env:
+          CHRONICLE_TEST_DSN: postgres://chronicle:chronicle@localhost:5432/chronicle?sslmode=disable
+        run: |
+          go test -coverprofile=coverage.out -timeout 300s ./...
+          go tool cover -func=coverage.out | tail -1
+
+  # The suite must pass on a machine with no database, or people stop running
+  # it locally. This job asserts the skip path rather than trusting it.
+  pgstore-no-database:
+    name: test (pgstore, no database)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
+        with:
+          go-version: "1.25"
+          cache: true
+          cache-dependency-path: pgstore/go.sum
+      - name: Test without CHRONICLE_TEST_DSN
+        working-directory: pgstore
+        run: go test -race -timeout 60s ./...
+
+  lint:
+    name: lint (${{ matrix.module }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        module: [".", "pgstore"]
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
@@ -50,3 +130,4 @@ jobs:
         uses: golangci/golangci-lint-action@82606bf257cbaff209d206a39f5134f0cfbfd2ee # v9
         with:
           version: latest
+          working-directory: ${{ matrix.module }}

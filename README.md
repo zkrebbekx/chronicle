@@ -213,34 +213,80 @@ fails.
 
 ```go
 type Store interface {
-    Apply(ctx context.Context, w Write) (time.Time, error)
+    Apply(ctx context.Context, req ApplyRequest) (time.Time, error)
     Get(ctx context.Context, q GetQuery) (*Record, error)
     Query(ctx context.Context, q Query) ([]Record, Cursor, error)
+}
+
+type ApplyRequest struct {
+    Entity EntityRef // what to lock
+    Valid  Interval  // which current records the plan needs
+    TxAt   time.Time // the log's proposed instant
+    Plan   Planner
+}
+
+// Planner computes the write from the entity's current overlapping records,
+// read inside the store's transaction, and the instant the store assigned.
+type Planner func(current []Record, txAt time.Time) (Write, error)
+
+type Write struct {
+    Supersede []RecordID
+    Insert    []Record
 }
 ```
 
 A write supersedes some records and inserts others, and the two must land
 together or a reader sees a gap or an overlap in valid time. `Apply` carries
-both halves, and there is deliberately no way to express them separately: an
-earlier design had `Put` and `Supersede` as distinct methods with `Apply` as an
-optional extension, and the fallback path was removed because "correct as long
-as nobody else is looking" is not a property a library can check or a caller
-should have to know about.
+both halves, and there is deliberately no way to express them separately.
 
-`Apply` returns the transaction instant it actually assigned. `Write.TxAt` is a
-proposal: a store with more than one writing process substitutes an instant of
-its own — no single process's clock is authoritative — and the log adopts what
-comes back.
+**`Apply` takes a plan, not a finished write**, and that shape is the whole
+isolation story. A write to one entity is a read-modify-write: read the
+overlapping records, compute the split, apply it. All three have to be one
+indivisible step. So the store does the read itself, inside its own transaction
+and under its own lock, hands the records to the plan, and applies what comes
+back without releasing either. chronicle's temporal reasoning stays above the
+store — a store never learns what a remainder is — but it runs where the store
+can protect it.
 
-The transaction inside `Apply` cannot cover the whole read-modify-write, because
-chronicle scans the overlapping records in a *separate* call before computing
-the split. No isolation level spans two calls. A shared store instead detects
-that the pre-state moved and returns `ErrConflict`; the log re-reads, re-splits
-and retries, `DefaultWriteRetries` times by default and configurable with
-`WithWriteRetries`.
+The earlier shape, where the log read through `Query` and passed a finished
+`Write` to `Apply`, was correct and **starved**. With the read outside the lock,
+the writer that waits for the lock always finds its plan stale by the time it
+gets in, and the writer that never waits never conflicts — so one writer lands
+everything and the other lands nothing. That is a stable equilibrium, not a
+probabilistic tail, and it was measured at 100% starvation of one of two writers
+over eighty writes. No isolation level fixes it, because no isolation level
+spans two separate calls.
+
+`Apply` returns the transaction instant it actually assigned, and stamps it on
+everything the write inserts and closes. `ApplyRequest.TxAt` is only a proposal:
+a store with more than one writing process substitutes an instant of its own —
+no single process's clock is authoritative — and the log adopts what comes back.
+
+`StaticWrite` wraps an already-decided `Write` as a `Planner`, for seeding and
+migrations. It opts out of the protection above, so a store may reject it with
+`ErrConflict`; the log retries such a conflict `DefaultWriteRetries` times, and
+`WithWriteRetries` tunes that.
 
 `MemStore` is the reference implementation and is safe for concurrent use.
 `pgstore` is the Postgres adapter — see below.
+
+## Conformance
+
+`chroniclefest` is the store contract as an executable specification. Point it
+at a factory and it exercises the whole surface — half-open boundaries, cursor
+ties, page boundaries, supersession idempotence, the non-overlap invariant:
+
+```go
+func TestMyStore(t *testing.T) {
+    chroniclefest.Run(t, func(t *testing.T) chronicle.Store {
+        return mystore.New(...)
+    })
+}
+```
+
+It runs against `MemStore` and `pgstore` on every build, which is what keeps the
+two answering identically rather than merely plausibly. It needs no driver, so
+it lives in the dependency-free root module.
 
 ## Postgres
 
@@ -300,16 +346,20 @@ entirely.
   through an intermediate state — replacement inserted, predecessor not yet
   closed — that a per-statement check would reject.
 - **Writes to one entity serialize.** `Apply` takes a `pg_advisory_xact_lock`
-  per `(kind, entity_id)`, sorted so that a multi-entity write cannot deadlock
-  against another ordering. Readers are never blocked.
-- **Stale plans are rejected, not applied.** Inside the same transaction `Apply`
-  re-checks that every record it means to supersede is still current, and the
-  deferred exclusion constraint catches anything the check missed. Either way
-  the result is `ErrConflict` and the log retries.
+  per `(kind, entity_id)` *before* it reads anything, and holds it to commit.
+  The overlapping records are then read `FOR UPDATE` inside the same
+  transaction and handed to the plan, so a plan cannot go stale between the
+  read and the write. Readers are never blocked, and writes to different
+  entities do not contend.
+- **Stale plans are rejected, not applied.** A `StaticWrite` was not planned
+  from that read, so `Apply` also re-checks that every record it means to
+  supersede is still current, and the deferred exclusion constraint catches
+  anything the check missed. Either way the result is `ErrConflict`.
 - **Transaction time comes from the database.** `Apply` stamps
-  `GREATEST(clock_timestamp(), <entity's latest transaction instant> + 1µs)`, so
-  transaction time is strictly increasing per entity across every process
-  writing to the store. `Write.TxAt` from the log is discarded.
+  `GREATEST(clock_timestamp(), <newest tx_from among the records being
+  closed> + 1µs)`, so a superseded record can never be left with an empty
+  transaction interval that no as-of query could see. `ApplyRequest.TxAt` from
+  the log is discarded.
 - **Microsecond resolution.** `timestamptz` stores microseconds, so a
   `time.Time` with nanosecond precision is truncated on the way in. chronicle's
   own transaction timestamps are assigned by the database and so are already
@@ -317,11 +367,34 @@ entirely.
   equality holds only to the microsecond.
 
 The isolation level is `READ COMMITTED`, deliberately. `SERIALIZABLE` is the
-usual advice, and here it would buy nothing: the read that needs protecting
-happens in a different transaction from the write, so SSI has no read dependency
-to track and would still let both writers proceed — while adding mandatory
-`40001` retry handling. The advisory lock plus in-transaction revalidation
-covers the same hazard without it.
+usual advice and it is the wrong tool here twice over. Under the old two-call
+shape it did nothing at all — the read that needed protecting was in an
+already-committed transaction, so SSI had no dependency to track — and under the
+current shape there is nothing left for it to protect, because the read and the
+write are already in one transaction behind one lock. It would add mandatory
+`40001` retry handling and buy nothing either way.
+
+Index usage is asserted rather than assumed: `TestQueryPlans` runs `EXPLAIN` over
+a seeded table and fails on a sequential scan. Every query in the surface plans
+as an index scan, including the keyset predicate, which Postgres takes as an
+`Index Cond` rather than a filter — so resuming a page is a seek, not a scan.
+
+### Not done here
+
+Partitioning on transaction time, which DESIGN.md lists alongside the exclusion
+constraint, **cannot coexist with it**. Postgres requires every unique or
+exclusion constraint on a partitioned table to include the partition key with
+equality, and `tx_from WITH =` is meaningless for a non-overlap constraint:
+
+```
+ERROR:  unique constraint on partitioned table must include all partitioning columns
+DETAIL: EXCLUDE constraint on table "p" lacks column "tx_from" which is part of
+        the partition key.
+```
+
+Requirement 1 wins. The retention story in phase 3 needs a different mechanism —
+partitioning the *archive* rather than the live table, or accepting a per-partition
+constraint and enforcing cross-partition non-overlap another way.
 
 ## Compliance, honestly
 
