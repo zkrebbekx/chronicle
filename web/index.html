@@ -1,0 +1,214 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>chronicle — bitemporal playground</title>
+    <meta
+      name="description"
+      content="An in-browser, zero-backend playground for chronicle: watch a retroactive correction as two coexisting beliefs on the valid-time / transaction-time grid."
+    />
+    <link rel="stylesheet" href="style.css" />
+    <!-- The Go WebAssembly runtime shim. Relative path so the site works at /chronicle/. -->
+    <script src="wasm_exec.js"></script>
+    <script src="app.js" defer></script>
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="topbar-inner">
+        <h1>chronicle</h1>
+        <p class="tagline">bitemporal entity history — a clickable playground</p>
+        <nav class="links">
+          <a href="https://github.com/zkrebbekx/chronicle" rel="noopener">Repo</a>
+          <a href="https://github.com/zkrebbekx/chronicle/blob/main/docs/DESIGN.md" rel="noopener">Design</a>
+          <a href="https://pkg.go.dev/github.com/zkrebbekx/chronicle" rel="noopener">API docs</a>
+        </nav>
+      </div>
+    </header>
+
+    <main>
+      <section class="intro">
+        <p>
+          Every record has <strong>two</strong> time axes. <em>Valid time</em> is when a fact
+          was true in the world — you supply it. <em>Transaction time</em> is when chronicle
+          learned it — the system assigns it and never rewrites it. A retroactive correction
+          therefore does not erase the old belief; it opens a new one above it, so
+          <em>“what did we believe in April that March had been?”</em> stays answerable.
+        </p>
+        <p class="teaching-note">
+          Here you drive transaction time yourself with the clock control below, so a write can
+          be placed at a chosen instant to demonstrate corrections. That is a teaching
+          affordance only — the real library assigns transaction time from the system clock and
+          exposes no way for a caller to write it. Attribution works the same way: the
+          <em>actor</em> is supplied here by you; a real service derives it from the caller's
+          authenticated identity. Intervals are half-open <code>[from, to)</code>; an empty end
+          means <em>unbounded</em> (an open box to the right on valid time, or to the top —
+          “current belief” — on transaction time).
+        </p>
+      </section>
+
+      <section class="scenarios" aria-label="Scenarios">
+        <span class="scenarios-label">Start with a story:</span>
+        <div id="scenario-buttons" class="scenario-buttons"></div>
+        <button id="reset-btn" class="btn ghost" type="button">Reset (empty log)</button>
+      </section>
+      <p id="scenario-note" class="scenario-note" hidden></p>
+
+      <div class="layout">
+        <!-- ============ LEFT: the bitemporal grid ============ -->
+        <section class="panel grid-panel" aria-label="Bitemporal grid">
+          <div class="panel-head">
+            <h2>The bitemporal grid</h2>
+            <div class="grid-controls">
+              <label class="field inline">
+                <span>Entity</span>
+                <select id="entity-select"></select>
+              </label>
+              <div class="colormode" role="group" aria-label="Colour by">
+                <span class="mini-label">Colour by</span>
+                <button class="chip" data-mode="value" type="button">value</button>
+                <button class="chip" data-mode="intent" type="button">intent</button>
+              </div>
+            </div>
+          </div>
+
+          <p class="grid-hint">
+            Each box is one stored record, spanning its <strong>valid</strong> interval (→) by
+            its <strong>transaction</strong> interval (↑). Click anywhere to ask
+            <code>Get(validAt, txAt)</code> — the record in force at that point lights up.
+          </p>
+
+          <div id="grid-wrap" class="grid-wrap">
+            <svg id="grid" xmlns="http://www.w3.org/2000/svg" role="img"
+                 aria-label="Valid time on the horizontal axis, transaction time on the vertical axis"></svg>
+          </div>
+          <div id="legend" class="legend"></div>
+
+          <!-- As-of explorer -->
+          <div class="asof">
+            <h3>As-of explorer</h3>
+            <div class="asof-sliders">
+              <label class="slider">
+                <span>Valid instant (→) <b id="validat-read">—</b></span>
+                <input id="validat-slider" type="range" min="0" max="1000" value="500" />
+              </label>
+              <label class="slider">
+                <span>Transaction instant (↑) <b id="txat-read">—</b></span>
+                <input id="txat-slider" type="range" min="0" max="1000" value="1000" />
+              </label>
+            </div>
+            <div id="asof-result" class="asof-result">Resolving…</div>
+          </div>
+        </section>
+
+        <!-- ============ RIGHT: write controls + panels ============ -->
+        <div class="side">
+          <section class="panel">
+            <h2>Write a record</h2>
+            <div class="clock-row">
+              <label class="field">
+                <span>Recorded at (transaction time)</span>
+                <input id="clock-input" type="datetime-local" step="1" />
+              </label>
+              <button id="clock-set" class="btn small" type="button">Set clock</button>
+            </div>
+            <p class="clock-hint" id="clock-hint">The next write lands at this transaction instant.</p>
+
+            <div class="grid2">
+              <label class="field">
+                <span>Kind</span>
+                <input id="w-kind" type="text" value="employee" />
+              </label>
+              <label class="field">
+                <span>Entity</span>
+                <input id="w-entity" type="text" value="alice" />
+              </label>
+            </div>
+
+            <label class="field">
+              <span>Data (JSON)</span>
+              <textarea id="w-data" rows="3" spellcheck="false">{"salary":100}</textarea>
+            </label>
+
+            <div class="grid2">
+              <label class="field">
+                <span>Valid from <em>(empty = always)</em></span>
+                <input id="w-validfrom" type="date" value="2024-03-01" />
+              </label>
+              <label class="field">
+                <span>Valid to <em>(empty = open)</em></span>
+                <input id="w-validto" type="date" />
+              </label>
+            </div>
+
+            <div class="grid2">
+              <label class="field">
+                <span>Actor</span>
+                <input id="w-actor" type="text" value="you@demo" />
+              </label>
+              <label class="field">
+                <span>Reason <em>(optional)</em></span>
+                <input id="w-reason" type="text" value="" />
+              </label>
+            </div>
+
+            <div class="btn-row">
+              <button id="put-btn" class="btn" type="button">Put (assert)</button>
+              <button id="correct-btn" class="btn correction" type="button">Correct</button>
+            </div>
+            <p id="write-msg" class="write-msg" role="status"></p>
+          </section>
+
+          <section class="panel">
+            <h2>Field history</h2>
+            <p class="panel-sub">
+              How belief about one field evolved over transaction time, at a fixed point in the
+              world — the single-field audit trail.
+            </p>
+            <div class="grid2">
+              <label class="field">
+                <span>Path (JSON Pointer)</span>
+                <input id="fh-path" type="text" value="/salary" />
+              </label>
+              <label class="field">
+                <span>Valid at</span>
+                <input id="fh-validat" type="date" value="2024-04-01" />
+              </label>
+            </div>
+            <div id="fieldhistory" class="fieldhistory"></div>
+          </section>
+
+          <section class="panel">
+            <div class="panel-head">
+              <h2>All versions</h2>
+              <div class="filters">
+                <label class="check"><input id="q-current" type="checkbox" /> current only</label>
+                <select id="q-intent" class="mini-select">
+                  <option value="">any intent</option>
+                  <option value="assert">assert</option>
+                  <option value="correction">correction</option>
+                  <option value="remainder">remainder</option>
+                </select>
+              </div>
+            </div>
+            <p class="panel-sub">
+              The raw log for this entity, via <code>Query</code>. Nothing is ever deleted; a
+              write closes a belief's transaction interval and opens a new one.
+            </p>
+            <div id="records-table" class="records-table"></div>
+          </section>
+        </div>
+      </div>
+
+      <footer class="footer">
+        <p>
+          Runs entirely in your tab over an in-memory store compiled to WebAssembly — no
+          backend, no network. Reload to reset. Built from
+          <a href="https://github.com/zkrebbekx/chronicle" rel="noopener">zkrebbekx/chronicle</a>.
+        </p>
+      </footer>
+    </main>
+
+    <div id="boot" class="boot">Loading the chronicle engine…</div>
+  </body>
+</html>
