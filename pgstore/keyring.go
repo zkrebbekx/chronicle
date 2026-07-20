@@ -65,17 +65,15 @@ func NewKeyring(db *sql.DB, opts ...Option) (*Keyring, error) {
 // past the library.
 func (k *Keyring) Table() string { return k.qualified }
 
-// Migrate creates the keys table if it is not already there. It is idempotent
-// and safe to run on every boot.
+// Migrate creates the keys table if it is not already there. It is idempotent,
+// safe to run on every boot, and — like [Store.Migrate] — serialized behind an
+// advisory lock so concurrent first boots cannot race the DDL.
 func (k *Keyring) Migrate(ctx context.Context) error {
 	sqlText, err := KeysSchemaSQL(k.schema, k.table)
 	if err != nil {
 		return err
 	}
-	if _, err := k.db.ExecContext(ctx, sqlText); err != nil {
-		return fmt.Errorf("pgstore: migrate %s: %w", k.qualified, err)
-	}
-	return nil
+	return runMigration(ctx, k.db, k.schema, k.table, k.qualified, sqlText)
 }
 
 // KeysSchemaSQL returns the keyring's DDL for the given names, for callers

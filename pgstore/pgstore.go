@@ -19,9 +19,11 @@
 //
 //   - Non-overlap of an entity's current valid intervals is an exclusion
 //     constraint over a GiST index, so it is structurally impossible rather
-//     than merely checked. It is DEFERRABLE INITIALLY DEFERRED because a
-//     correct write passes through an intermediate state that a per-statement
-//     check would reject — see [Store.Apply].
+//     than merely checked. It is DEFERRABLE INITIALLY DEFERRED, which keeps
+//     the constraint correct under any statement order; the shipped Apply
+//     closes superseded records before inserting their replacements and so
+//     never passes through an overlapping state itself, but the deferral costs
+//     nothing and does not depend on that ordering staying true.
 //   - Transaction time is assigned by the database, inside the write's own
 //     transaction. No process's clock is authoritative once there is more than
 //     one process.
@@ -30,13 +32,16 @@
 //
 // # Isolation
 //
-// Read [Store.Apply] before deploying this. chronicle's write path is a
-// read-modify-write split across two store calls, which no isolation level can
-// make atomic, and the adapter's answer is a per-entity lock plus conflict
-// detection plus retry above the store. The consequence callers inherit is
-// that a write can fail with [chronicle.ErrConflict] under contention, which
-// [chronicle.Log] handles by retrying and callers driving the store directly
-// must handle themselves.
+// A write is read-plan-apply in one transaction behind a per-entity advisory
+// lock: [Store.Apply] locks the entity, reads its current overlapping records
+// FOR UPDATE, hands them to the plan, and applies the result before releasing
+// either — so a plan cannot go stale between the read and the write, and
+// ordinary planned writes do not conflict at all. [chronicle.ErrConflict]
+// remains possible for exactly two callers: a [chronicle.StaticWrite], which
+// was not planned from the store's own read, and anything writing to the
+// table that is not chronicle, which the deferred exclusion constraint
+// catches at commit. [chronicle.Log] retries those; a caller driving the
+// store directly retries for itself.
 //
 // # Resolution
 //
@@ -180,7 +185,8 @@ func qualify(schema, name string) string {
 func (s *Store) Table() string { return s.qualified }
 
 // Migrate creates the table, its indexes and its constraints if they are not
-// already there. It is idempotent and safe to run on every boot.
+// already there. It is idempotent, safe to run on every boot, and safe to run
+// from any number of replicas booting at once — see [runMigration].
 //
 // It also runs CREATE EXTENSION IF NOT EXISTS btree_gist, which the exclusion
 // constraint needs and which requires a role permitted to create extensions.
@@ -194,9 +200,44 @@ func (s *Store) Migrate(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	if _, err := s.db.ExecContext(ctx, sqlText); err != nil {
-		return fmt.Errorf("pgstore: migrate %s: %w", s.qualified, err)
+	return runMigration(ctx, s.db, s.schema, s.table, s.qualified, sqlText)
+}
+
+// runMigration executes DDL inside one transaction, behind an advisory lock
+// keyed on the (schema, table) pair.
+//
+// The lock is what makes concurrent first boots safe. IF NOT EXISTS is only
+// idempotent, not race-free: two replicas that both find the table absent both
+// try to create it, and one loses on the duplicate pg_type row underneath —
+// SQLSTATE 23505, surfaced as a crash loop on exactly the first boot, the one
+// deploy nobody has rehearsed twice. With the lock, N replicas queue; the
+// first creates everything and the rest find it already there.
+func runMigration(ctx context.Context, db *sql.DB, schema, table, qualified, ddl string) error {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("pgstore: migrate %s: begin: %w", qualified, err)
 	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback()
+		}
+	}()
+
+	// The same key derivation as the per-entity write lock: a server-side hash
+	// so the key does not depend on any process's hash seed, and \x1f between
+	// the parts so ("a", "bc") and ("ab", "c") cannot collide.
+	key := schema + "\x1f" + table
+	if _, err := tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, key); err != nil {
+		return fmt.Errorf("pgstore: migrate %s: lock: %w", qualified, err)
+	}
+	if _, err := tx.ExecContext(ctx, ddl); err != nil {
+		return fmt.Errorf("pgstore: migrate %s: %w", qualified, err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("pgstore: migrate %s: commit: %w", qualified, err)
+	}
+	committed = true
 	return nil
 }
 

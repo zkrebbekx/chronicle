@@ -4,7 +4,10 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
+	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -239,6 +242,70 @@ func TestMigrate(t *testing.T) {
 			})
 		})
 	})
+
+	t.Run("given several replicas booting against one fresh schema at once", func(t *testing.T) {
+		// The first boot is the race: IF NOT EXISTS is idempotent but not
+		// atomic, so without the migration's advisory lock, replicas that all
+		// find the table absent all try to create it and the losers crash on
+		// the duplicate pg_type row (23505) — measured at 33 failures out of
+		// 48 attempts before the lock existed. Every round here runs against a
+		// schema no Migrate has ever touched, which a sequential repeat of
+		// Migrate cannot exercise.
+		const workers = 6
+		schema := fmt.Sprintf("chronicle_test_boot_%d_%d", os.Getpid(), schemaSeq.Add(1))
+		if _, err := db.ExecContext(ctx, `CREATE SCHEMA "`+schema+`"`); err != nil {
+			t.Fatalf("creating schema %s: %v", schema, err)
+		}
+		t.Cleanup(func() {
+			if _, err := db.Exec(`DROP SCHEMA IF EXISTS "` + schema + `" CASCADE`); err != nil {
+				t.Errorf("dropping schema %s: %v", schema, err)
+			}
+		})
+
+		t.Run("when they all migrate concurrently", func(t *testing.T) {
+			errs := make([]error, workers)
+			start := make(chan struct{})
+			var wg sync.WaitGroup
+			for w := 0; w < workers; w++ {
+				wg.Add(1)
+				go func(w int) {
+					defer wg.Done()
+					store, err := pgstore.New(db, pgstore.WithSchema(schema))
+					if err != nil {
+						errs[w] = err
+						return
+					}
+					<-start // line the replicas up so they genuinely collide
+					errs[w] = store.Migrate(ctx)
+				}(w)
+			}
+			close(start)
+			wg.Wait()
+
+			t.Run("then every migration succeeds", func(t *testing.T) {
+				for w, err := range errs {
+					if err != nil {
+						t.Errorf("replica %d: Migrate = %v; want nil — a first boot must not "+
+							"crash-loop on its own concurrency", w, err)
+					}
+				}
+			})
+			t.Run("then the migrated store works", func(t *testing.T) {
+				store, err := pgstore.New(db, pgstore.WithSchema(schema))
+				if err != nil {
+					t.Fatalf("New failed: %v", err)
+				}
+				if _, err := store.Apply(ctx, chronicle.ApplyRequest{
+					Entity: chronicle.EntityRef{Kind: "employee", EntityID: "e1"},
+					Plan: chronicle.StaticWrite(chronicle.Write{Insert: []chronicle.Record{{
+						ID: "boot-1", Kind: "employee", EntityID: "e1", ValidFrom: march, Actor: alice,
+					}}}),
+				}); err != nil {
+					t.Fatalf("Apply after concurrent migration failed: %v", err)
+				}
+			})
+		})
+	})
 }
 
 // TestApplyEdgeCases covers the corners of the write path that the conformance
@@ -392,6 +459,111 @@ func TestApplyEdgeCases(t *testing.T) {
 				}
 				if len(got.Meta) != len(meta) {
 					t.Fatalf("meta has %d keys; want %d", len(got.Meta), len(meta))
+				}
+			})
+		})
+	})
+
+	t.Run("given records the schema itself must reject", func(t *testing.T) {
+		// Only a write that bypasses the Log's validation can carry these, so
+		// they arrive as StaticWrites. The raw driver error is wrapped in a
+		// typed one; its message still names the violated constraint.
+		store := newStore(t, db)
+		cases := []struct {
+			name string
+			rec  chronicle.Record
+		}{
+			{"an empty valid interval", chronicle.Record{
+				ID: "bad-empty", Kind: "employee", EntityID: "e1",
+				ValidFrom: march, ValidTo: march, Actor: alice,
+			}},
+			{"an inverted valid interval", chronicle.Record{
+				ID: "bad-inverted", Kind: "employee", EntityID: "e1",
+				ValidFrom: june, ValidTo: march, Actor: alice,
+			}},
+			{"a missing actor", chronicle.Record{
+				ID: "bad-actor", Kind: "employee", EntityID: "e1", ValidFrom: march,
+			}},
+			{"an undefined intent", chronicle.Record{
+				ID: "bad-intent", Kind: "employee", EntityID: "e1",
+				ValidFrom: march, Actor: alice, Intent: chronicle.Intent(200),
+			}},
+		}
+		for _, tc := range cases {
+			t.Run("when one carrying "+tc.name+" is applied", func(t *testing.T) {
+				_, err := store.Apply(ctx, chronicle.ApplyRequest{
+					Entity: chronicle.EntityRef{Kind: "employee", EntityID: "e1"},
+					Plan:   chronicle.StaticWrite(chronicle.Write{Insert: []chronicle.Record{tc.rec}}),
+				})
+				t.Run("then it is rejected with the typed error", func(t *testing.T) {
+					var ire *pgstore.InvalidRecordError
+					if !errors.As(err, &ire) {
+						t.Fatalf("Apply = %v; want an *InvalidRecordError rather than a raw "+
+							"driver error", err)
+					}
+					if !strings.Contains(ire.Error(), "rejected by the schema") {
+						t.Fatalf("Error() = %q; want it to say the schema did the rejecting", ire.Error())
+					}
+					if ire.Unwrap() == nil {
+						t.Fatal("Unwrap() = nil; the driver's error, with its SQLSTATE and " +
+							"constraint name, must stay reachable")
+					}
+				})
+				t.Run("then nothing landed", func(t *testing.T) {
+					if n := countRows(ctx, t, db, store.Table()); n != 0 {
+						t.Fatalf("%d rows survived a schema-rejected write", n)
+					}
+				})
+			})
+		}
+	})
+
+	t.Run("given a current record stamped ahead of the database clock", func(t *testing.T) {
+		// A backward step of the database clock looks exactly like this: the
+		// record to supersede carries a tx_from in the future. A planned write
+		// is safe — the record is in the plan's read, which assignTxTime
+		// floors over — but an unplanned StaticWrite names its targets without
+		// any read, and without the extended floor the close would produce
+		// tx_to <= tx_from and a constraint violation.
+		store := newStore(t, db)
+		if _, err := db.ExecContext(ctx, `INSERT INTO `+store.Table()+
+			` (id, kind, entity_id, valid_from, tx_from, actor_id) VALUES `+
+			`('future', 'employee', 'e1', $1, clock_timestamp() + interval '1 hour', 'u-alice')`,
+			march); err != nil {
+			t.Fatalf("seeding the future record: %v", err)
+		}
+
+		t.Run("when an unplanned write supersedes it", func(t *testing.T) {
+			tx, err := store.Apply(ctx, chronicle.ApplyRequest{
+				Plan: chronicle.StaticWrite(chronicle.Write{
+					Supersede: []chronicle.RecordID{"future"},
+					Insert: []chronicle.Record{{
+						ID: "replacement", Kind: "employee", EntityID: "e1",
+						ValidFrom: march, Actor: alice,
+					}},
+				}),
+			})
+			t.Run("then it succeeds", func(t *testing.T) {
+				if err != nil {
+					t.Fatalf("Apply = %v; the tx floor must cover the supersede targets, not "+
+						"only the records read for the plan", err)
+				}
+			})
+			t.Run("then the closed record keeps a non-empty transaction interval", func(t *testing.T) {
+				var open bool
+				var txFrom, txTo time.Time
+				if qerr := db.QueryRowContext(ctx, `SELECT tx_to IS NULL, tx_from, COALESCE(tx_to, 'epoch') FROM `+
+					store.Table()+` WHERE id = 'future'`).Scan(&open, &txFrom, &txTo); qerr != nil {
+					t.Fatalf("reading the superseded record: %v", qerr)
+				}
+				if open {
+					t.Fatal("the record was not superseded")
+				}
+				if !txTo.After(txFrom) {
+					t.Fatalf("tx interval [%s, %s) is empty or inverted", txFrom, txTo)
+				}
+				if !tx.After(txFrom) {
+					t.Fatalf("assigned instant %s does not sit past the target's tx_from %s", tx, txFrom)
 				}
 			})
 		})

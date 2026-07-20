@@ -65,10 +65,12 @@ CREATE TABLE IF NOT EXISTS $TABLE$ (
 -- checked in Go: no two current records for one entity may cover the same
 -- valid instant.
 --
--- DEFERRABLE INITIALLY DEFERRED is not a preference. Constraints are checked
--- per statement, and a correct Apply passes through an intermediate state in
--- which the replacement row is already inserted and its predecessor is not yet
--- closed. A non-deferred constraint rejects ordinary correct writes.
+-- DEFERRABLE INITIALLY DEFERRED keeps the constraint correct under any
+-- statement order. The shipped Apply closes superseded records before
+-- inserting their replacements, so it never passes through an overlapping
+-- state itself -- but the deferral costs nothing, and a future writer that
+-- inserts first, or batches several writes into one transaction, stays
+-- correct without anyone having to remember why.
 DO $$
 BEGIN
     ALTER TABLE $TABLE$ ADD CONSTRAINT $NAME$_no_overlap

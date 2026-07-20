@@ -59,15 +59,21 @@ const insertBatch = 1000
 //     all, and for anything writing to the table that is not chronicle. It
 //     surfaces at COMMIT and is reported as [chronicle.ErrConflict].
 //
+// A record the schema rejects outright — an inverted interval, a missing
+// actor, an unknown intent — is reported as [*InvalidRecordError]. Only a
+// write that bypasses [chronicle.Log]'s validation can produce one.
+//
 // # Transaction time
 //
 // The instant is assigned here, from the database, and is the greater of
 // clock_timestamp() and one microsecond past the newest transaction start
-// among the records this write touches. clock_timestamp() alone would be
-// enough almost always — every writer reads the same server clock — but two
-// writes to one entity inside a single microsecond would tie, and a record
-// superseded at its own TxFrom has an empty transaction interval that no
-// as-of query can ever see.
+// among the current records read for the plan — extended, before anything is
+// closed, over the supersede targets the plan actually named, which for an
+// unplanned write need not be records any read returned. clock_timestamp()
+// alone would be enough almost always — every writer reads the same server
+// clock — but two writes to one entity inside a single microsecond would tie,
+// and a record superseded at its own TxFrom has an empty transaction interval
+// that no as-of query can ever see.
 //
 // Whatever TxFrom an incoming record carries is overwritten, and
 // ApplyRequest.TxAt is ignored. There is no path by which a caller can choose
@@ -134,6 +140,21 @@ func (s *Store) Apply(ctx context.Context, req chronicle.ApplyRequest) (time.Tim
 	if len(w.Insert) > 0 {
 		if err := checkTargetsCurrent(w.Supersede, targets); err != nil {
 			return time.Time{}, err
+		}
+	}
+
+	// The floor in assignTxTime covered the records read for the plan, and for
+	// a planned write the supersede targets are a subset of those, so this
+	// raises nothing. An unplanned write names its targets itself, and a
+	// backward step of the database clock could then put the assigned instant
+	// at or before a target's tx_from — closing it with tx_to <= tx_from,
+	// which the schema rejects. The targets' tx_from values are already in
+	// hand from the row lock, so the floor extends over them for free. The
+	// plan saw the pre-bump instant, which is harmless: an unplanned write's
+	// planner ignores it by construction.
+	for _, tgt := range targets {
+		if !txAt.After(tgt.txFrom) {
+			txAt = tgt.txFrom.Add(time.Microsecond)
 		}
 	}
 
@@ -293,11 +314,13 @@ func checkTargetsCurrent(ids []chronicle.RecordID, targets map[chronicle.RecordI
 // assignTxTime picks the write's transaction instant, database-side.
 //
 // The floor is one microsecond past the newest transaction start among the
-// records the write is about to close, which is the only pair the ordering has
-// to hold for: a record superseded at its own TxFrom has an empty transaction
-// interval and is invisible to every as-of query. Writers to one entity are
-// serialized by the advisory lock, so the record the previous writer left
-// behind is in this set and this instant is strictly past it.
+// current records read for the plan, which contain every record a planned
+// write can close: a record superseded at its own TxFrom has an empty
+// transaction interval and is invisible to every as-of query. Writers to one
+// entity are serialized by the advisory lock, so the record the previous
+// writer left behind is in this set and this instant is strictly past it.
+// Unplanned writes read nothing here; their supersede targets are floored
+// separately in Apply, once the plan has named them.
 func (s *Store) assignTxTime(ctx context.Context, tx *sql.Tx, current []chronicle.Record) (time.Time, error) {
 	var floor any
 	var newest time.Time
@@ -398,6 +421,9 @@ func (s *Store) insertChunk(ctx context.Context, tx *sql.Tx, recs []chronicle.Re
 				Err:    err,
 			}
 		}
+		if isSchemaRejection(err) {
+			return &InvalidRecordError{Err: err}
+		}
 		return fmt.Errorf("pgstore: insert: %w", err)
 	}
 	return nil
@@ -456,3 +482,43 @@ func isExclusionViolation(err error) bool {
 	return strings.Contains(err.Error(), "23P01") ||
 		strings.Contains(err.Error(), "conflicting key value violates exclusion constraint")
 }
+
+// isSchemaRejection reports whether err is the schema itself refusing a
+// record: a CHECK constraint violation (23514) or a data exception (class 22 —
+// an inverted range the generated tstzrange cannot build, a value the column
+// type cannot hold).
+//
+// No string fallback here, unlike [isExclusionViolation]: misclassifying a
+// conflict breaks the retry loop, so it earns a second net, while
+// misclassifying a malformed record merely costs the caller a nicer message.
+func isSchemaRejection(err error) bool {
+	var st sqlStater
+	if !errors.As(err, &st) {
+		return false
+	}
+	state := st.SQLState()
+	return state == "23514" || strings.HasPrefix(state, "22")
+}
+
+// InvalidRecordError reports a record the database schema rejected outright:
+// an empty or inverted interval, an unknown intent, a missing actor, or data
+// no column type can hold. It wraps the driver's error, whose message names
+// the violated constraint.
+//
+// Only writes that bypass [chronicle.Log] can reach it. The log validates
+// before it plans, so a record that fails the schema here arrived through
+// [chronicle.StaticWrite] or some other direct driver of [Store.Apply] —
+// paths that promise their input is already correct.
+type InvalidRecordError struct {
+	// Err is the driver's error, carrying the SQLSTATE and the constraint
+	// name.
+	Err error
+}
+
+// Error implements the error interface.
+func (e *InvalidRecordError) Error() string {
+	return "pgstore: record rejected by the schema: " + e.Err.Error()
+}
+
+// Unwrap returns the driver's error so [errors.As] can reach it.
+func (e *InvalidRecordError) Unwrap() error { return e.Err }
