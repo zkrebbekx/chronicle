@@ -51,6 +51,32 @@ import (
 // sustained contention one writer wins every race and the other never lands a
 // write at all. That is not a tuning problem, and no isolation level fixes it,
 // because no isolation level spans two separate calls.
+//
+// # Implementing a Store
+//
+// The contract, in the order implementations most often get it wrong:
+//
+//   - Honour context cancellation on every method: a cancelled Apply must land
+//     nothing. This is required, not advisory — the conformance suite injects
+//     cancelled contexts and fails a store that writes anyway. pgstore rolls
+//     the transaction back; MemStore checks before mutating.
+//   - Copy records in both directions. A caller must not be able to reach into
+//     the store through a slice or map it passed in, nor corrupt it by
+//     mutating a record it read back.
+//   - Assign transaction time centrally when more than one process writes.
+//     ApplyRequest.TxAt is only a proposal; a shared store takes the instant
+//     from somewhere all writers agree on — the database's clock — and returns
+//     what it actually stamped.
+//   - Call [Query.Validate] before touching the backing store, so a malformed
+//     query is the same typed error from every implementation.
+//   - Agree with [Query.Matches] on filtering and with [CompareRecords] on
+//     order. These exported definitions are the arbiters; a WHERE clause and
+//     ORDER BY are translations of them, and the suite checks the translation.
+//   - Build cursors with [EncodeCursor] and read them with [DecodeCursor], so
+//     pagination survives a caller switching stores.
+//
+// Then certify with chroniclefest.Run, which is the executable form of this
+// list and of everything the wording above underspecifies.
 type Store interface {
 	// Apply computes and applies one indivisible change.
 	//
@@ -312,7 +338,7 @@ func (q Query) Validate() error {
 		return &IntervalError{Field: "transaction", Interval: q.Tx, Err: ErrInvalidInterval}
 	}
 	if !q.Intent.valid() {
-		return &KindError{Err: ErrUnknownKind}
+		return &IntentError{Intent: q.Intent, Err: ErrUnknownIntent}
 	}
 	return nil
 }

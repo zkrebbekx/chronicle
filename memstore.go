@@ -3,6 +3,7 @@ package chronicle
 import (
 	"context"
 	"errors"
+	"fmt"
 	"slices"
 	"sync"
 	"time"
@@ -76,9 +77,14 @@ func (s *MemStore) Close() error {
 // pre-state this write is in the middle of replacing.
 //
 // MemStore accepts the log's proposed transaction instant and returns it
-// unchanged. It can: a MemStore has exactly one process writing to it, so the
+// unchanged. It can: a MemStore has exactly one [Log] writing to it, so that
 // log's ratchet is authoritative. A store shared between processes must assign
 // transaction time itself.
+//
+// Because the proposal is adopted verbatim, a zero one is refused with
+// [ErrZeroTxTime] rather than stamped: a zero TxFrom would read as "always
+// believed" and a zero TxTo as "still current", either of which corrupts the
+// transaction axis silently.
 func (s *MemStore) Apply(ctx context.Context, req ApplyRequest) (time.Time, error) {
 	if err := ctx.Err(); err != nil {
 		return time.Time{}, err
@@ -92,6 +98,9 @@ func (s *MemStore) Apply(ctx context.Context, req ApplyRequest) (time.Time, erro
 	defer s.mu.Unlock()
 	if s.closed {
 		return time.Time{}, ErrClosed
+	}
+	if txAt.IsZero() {
+		return time.Time{}, fmt.Errorf("chronicle: MemStore adopts the proposed transaction instant and so cannot accept a zero one: %w", ErrZeroTxTime)
 	}
 
 	w, err := req.Plan(s.currentLocked(req.Entity, req.Valid), txAt)
@@ -166,22 +175,33 @@ func (s *MemStore) insertLocked(recs []Record, txFrom time.Time) error {
 // pre-state that has since moved, and applying the other half would leave the
 // entity's timeline overlapping. That is [ErrConflict], not a no-op. A
 // supersession on its own stays idempotent.
+//
+// Validation runs over every target before anything is mutated, because the
+// contract on [ErrConflict] is that nothing was applied. A single pass that
+// closed records as it went would, on finding a stale target late in the list,
+// leave the earlier ones already closed — half a write, observable to every
+// reader from then on.
 func (s *MemStore) supersedeLocked(ids []RecordID, txTo time.Time, strict bool) error {
 	if s.closed {
 		return ErrClosed
 	}
-	for _, id := range ids {
-		idx, ok := s.byID[id]
-		if !ok {
-			if strict {
+	if txTo.IsZero() {
+		return fmt.Errorf("chronicle: supersession with a zero transaction instant would leave records reading as current: %w", ErrZeroTxTime)
+	}
+	if strict {
+		for _, id := range ids {
+			idx, ok := s.byID[id]
+			if !ok {
 				return conflictf("record %s no longer exists", id)
 			}
-			continue
-		}
-		if !s.recs[idx].TxTo.IsZero() {
-			if strict {
+			if !s.recs[idx].TxTo.IsZero() {
 				return conflictf("record %s was already superseded", id)
 			}
+		}
+	}
+	for _, id := range ids {
+		idx, ok := s.byID[id]
+		if !ok || !s.recs[idx].TxTo.IsZero() {
 			continue
 		}
 		s.recs[idx].TxTo = txTo.UTC()

@@ -95,7 +95,7 @@ func TestMemStore(t *testing.T) {
 			t.Run("then the original is kept rather than overwritten", func(t *testing.T) {
 				dup := rec
 				dup.Data = []byte("overwritten")
-				if _, err := s.Apply(ctx, ApplyRequest{Plan: StaticWrite(Write{Insert: []Record{dup}})}); err != nil {
+				if _, err := s.Apply(ctx, ApplyRequest{TxAt: t2, Plan: StaticWrite(Write{Insert: []Record{dup}})}); err != nil {
 					t.Fatalf("Apply failed: %v", err)
 				}
 				if s.Len() != 1 {
@@ -333,8 +333,13 @@ func TestMemStore(t *testing.T) {
 			})
 			t.Run("then an undefined intent is rejected", func(t *testing.T) {
 				_, _, err := s.Query(ctx, Query{Intent: Intent(200), HasIntent: true})
-				if !errors.Is(err, ErrUnknownKind) {
-					t.Fatalf("Query = %v; want an error", err)
+				if !errors.Is(err, ErrUnknownIntent) {
+					t.Fatalf("Query = %v; want ErrUnknownIntent — an out-of-range intent is not "+
+						"a kind problem, and reporting it as one sent callers down the wrong branch", err)
+				}
+				var ie *IntentError
+				if !errors.As(err, &ie) || ie.Intent != Intent(200) {
+					t.Fatalf("error = %v; want an *IntentError carrying the offending value", err)
 				}
 			})
 		})
@@ -595,6 +600,14 @@ func TestAsHelpers(t *testing.T) {
 				}
 			})
 		})
+		t.Run("when Believed is used", func(t *testing.T) {
+			t.Run("then only the transaction axis is pinned", func(t *testing.T) {
+				a := Believed(t2)
+				if !a.TxAt.Equal(t2) || !a.ValidAt.IsZero() || a.IsZero() {
+					t.Fatalf("Believed(%s) = %+v; want only TxAt set — it is ValidAt's mirror image", t2, a)
+				}
+			})
+		})
 		t.Run("when AsOf is used", func(t *testing.T) {
 			t.Run("then both axes are pinned to the same instant", func(t *testing.T) {
 				a := AsOf(t2)
@@ -714,6 +727,149 @@ func TestActorAndRecordHelpers(t *testing.T) {
 			t.Run("then values at or beyond the width are unchanged", func(t *testing.T) {
 				if got := pad(12345, 4); got != "12345" {
 					t.Fatalf("pad(12345, 4) = %q; want 12345", got)
+				}
+			})
+		})
+	})
+}
+
+func TestMemStoreConflictLeavesNothingApplied(t *testing.T) {
+	ctx := context.Background()
+
+	// The store starts with two current records, so a strict supersession list
+	// can put its poison pill last: if validation and mutation were one pass,
+	// both healthy targets would already be closed by the time the bad ID is
+	// discovered, and the "nothing is applied" contract on ErrConflict would
+	// be quietly false.
+	seed := func(t *testing.T) *MemStore {
+		t.Helper()
+		s := NewMemStore()
+		seedRecords(t, s, []Record{
+			{ID: "r1", Kind: employee, EntityID: "e", Data: []byte("v1"), ValidFrom: t1, ValidTo: t2, TxFrom: t1, Actor: alice},
+			{ID: "r2", Kind: employee, EntityID: "e", Data: []byte("v2"), ValidFrom: t2, ValidTo: t3, TxFrom: t1, Actor: alice},
+		})
+		return s
+	}
+
+	assertUntouched := func(t *testing.T, s *MemStore) {
+		t.Helper()
+		if n := s.Len(); n != 2 {
+			t.Fatalf("Len() = %d; want 2 — a conflicting write must insert nothing", n)
+		}
+		recs, _, err := s.Query(ctx, Query{})
+		if err != nil {
+			t.Fatalf("Query failed: %v", err)
+		}
+		for _, r := range recs {
+			if !r.IsCurrent() {
+				t.Fatalf("record %s was closed by a write that reported ErrConflict; the "+
+					"contract says nothing is applied, not the first half", r.ID)
+			}
+		}
+	}
+
+	t.Run("given a split whose last supersession target no longer exists", func(t *testing.T) {
+		s := seed(t)
+		t.Run("when it is applied", func(t *testing.T) {
+			_, err := s.Apply(ctx, ApplyRequest{TxAt: t4, Plan: StaticWrite(Write{
+				Supersede: []RecordID{"r1", "r2", "ghost"},
+				Insert:    []Record{{ID: "r3", Kind: employee, EntityID: "e", ValidFrom: t1, ValidTo: t3, Actor: bob}},
+			})})
+			t.Run("then it is a conflict", func(t *testing.T) {
+				if !errors.Is(err, ErrConflict) {
+					t.Fatalf("Apply = %v; want ErrConflict", err)
+				}
+			})
+			t.Run("then the earlier targets were not closed", func(t *testing.T) {
+				assertUntouched(t, s)
+			})
+		})
+	})
+
+	t.Run("given a split whose last supersession target is already closed", func(t *testing.T) {
+		s := seed(t)
+		seedRecords(t, s, []Record{
+			{ID: "r0", Kind: employee, EntityID: "stale", Data: []byte("old"), ValidFrom: t1, TxFrom: t2, Actor: alice},
+		})
+		if _, err := s.Apply(ctx, ApplyRequest{TxAt: t3, Plan: StaticWrite(Write{Supersede: []RecordID{"r0"}})}); err != nil {
+			t.Fatalf("closing the stale record failed: %v", err)
+		}
+		t.Run("when it is applied", func(t *testing.T) {
+			_, err := s.Apply(ctx, ApplyRequest{TxAt: t4, Plan: StaticWrite(Write{
+				Supersede: []RecordID{"r1", "r2", "r0"},
+				Insert:    []Record{{ID: "r3", Kind: employee, EntityID: "e", ValidFrom: t1, ValidTo: t3, Actor: bob}},
+			})})
+			t.Run("then it is a conflict", func(t *testing.T) {
+				if !errors.Is(err, ErrConflict) {
+					t.Fatalf("Apply = %v; want ErrConflict", err)
+				}
+			})
+			t.Run("then the healthy targets were not closed", func(t *testing.T) {
+				if n := s.Len(); n != 3 {
+					t.Fatalf("Len() = %d; want 3 — a conflicting write must insert nothing", n)
+				}
+				recs, _, err := s.Query(ctx, Query{Kind: employee, EntityID: "e"})
+				if err != nil {
+					t.Fatalf("Query failed: %v", err)
+				}
+				for _, r := range recs {
+					if !r.IsCurrent() {
+						t.Fatalf("record %s was closed by a write that reported ErrConflict; the "+
+							"contract says nothing is applied, not the first half", r.ID)
+					}
+				}
+			})
+		})
+	})
+}
+
+func TestMemStoreRefusesAZeroTransactionInstant(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("given a request proposing no transaction instant", func(t *testing.T) {
+		s := NewMemStore()
+		t.Run("when it is applied", func(t *testing.T) {
+			_, err := s.Apply(ctx, ApplyRequest{Plan: StaticWrite(Write{
+				Insert: []Record{{ID: "r1", Kind: employee, EntityID: "e", ValidFrom: t1, Actor: alice}},
+			})})
+			t.Run("then it is refused with the typed error", func(t *testing.T) {
+				if !errors.Is(err, ErrZeroTxTime) {
+					t.Fatalf("Apply = %v; want ErrZeroTxTime — MemStore adopts the proposal, and "+
+						"a zero TxFrom would read as 'always believed'", err)
+				}
+			})
+			t.Run("then nothing was written", func(t *testing.T) {
+				if n := s.Len(); n != 0 {
+					t.Fatalf("Len() = %d; want 0", n)
+				}
+			})
+		})
+	})
+
+	t.Run("given a supersession that would stamp a zero TxTo", func(t *testing.T) {
+		// Unreachable through Apply, which guards first; the inner check is
+		// defence in depth, because TxTo == zero means "current" and a zero
+		// stamp would un-supersede rather than supersede.
+		s := NewMemStore()
+		seedRecords(t, s, []Record{
+			{ID: "r1", Kind: employee, EntityID: "e", Data: []byte("v"), ValidFrom: t1, TxFrom: t1, Actor: alice},
+		})
+		t.Run("when the inner supersession runs", func(t *testing.T) {
+			s.mu.Lock()
+			err := s.supersedeLocked([]RecordID{"r1"}, time.Time{}, false)
+			s.mu.Unlock()
+			t.Run("then it is refused with the typed error", func(t *testing.T) {
+				if !errors.Is(err, ErrZeroTxTime) {
+					t.Fatalf("supersedeLocked = %v; want ErrZeroTxTime", err)
+				}
+			})
+			t.Run("then the record is still current", func(t *testing.T) {
+				recs, _, qerr := s.Query(ctx, Query{})
+				if qerr != nil {
+					t.Fatalf("Query failed: %v", qerr)
+				}
+				if len(recs) != 1 || !recs[0].IsCurrent() {
+					t.Fatal("the record was closed by a refused supersession")
 				}
 			})
 		})

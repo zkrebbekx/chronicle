@@ -30,6 +30,27 @@ var (
 	// the allow-list when the log was constructed [WithKinds].
 	ErrUnknownKind = errors.New("chronicle: unknown kind")
 
+	// ErrUnknownIntent is returned for an intent value chronicle does not
+	// define — a [Query] whose intent filter is enabled but names no defined
+	// [Intent]. Errors wrapping it are always an [*IntentError].
+	ErrUnknownIntent = errors.New("chronicle: unknown intent")
+
+	// ErrInvalidMeta is returned by every write path for caller-supplied
+	// metadata no store can hold: a key or value containing a NUL byte.
+	// PostgreSQL jsonb cannot represent NUL inside a string, so accepting one
+	// would make the same write succeed on [MemStore] and fail on pgstore —
+	// the write is rejected at the API boundary instead, identically
+	// everywhere. Distinct from [ErrReservedMeta], which rejects keys chronicle
+	// reserves for itself rather than values no backend can store.
+	ErrInvalidMeta = errors.New("chronicle: invalid metadata")
+
+	// ErrZeroTxTime is returned by a store handed a zero transaction instant
+	// it would otherwise have stamped. A zero instant is not a timestamp:
+	// written as TxFrom it reads as "always believed" and as TxTo it reads as
+	// "still current", so a store that adopts proposed instants ([MemStore])
+	// refuses a zero one rather than corrupting the transaction axis silently.
+	ErrZeroTxTime = errors.New("chronicle: zero transaction instant")
+
 	// ErrCodec is returned when a record's data cannot be decoded for
 	// structural comparison. [Log.Diff] reports it rather than silently
 	// reporting no changes: under-reporting a change is the one failure mode a
@@ -151,6 +172,23 @@ func (e *KindError) Error() string {
 
 // Unwrap returns the wrapped sentinel so [errors.Is] matches.
 func (e *KindError) Unwrap() error { return e.Err }
+
+// IntentError reports an intent value chronicle does not define, carrying the
+// offending value. It wraps [ErrUnknownIntent].
+type IntentError struct {
+	// Intent is the offending value.
+	Intent Intent
+	// Err is the wrapped sentinel.
+	Err error
+}
+
+// Error implements the error interface.
+func (e *IntentError) Error() string {
+	return fmt.Sprintf("chronicle: unknown intent %d", uint8(e.Intent))
+}
+
+// Unwrap returns the wrapped sentinel so [errors.Is] matches.
+func (e *IntentError) Unwrap() error { return e.Err }
 
 // CodecError reports a failure to encode or decode record data, carrying the
 // codec's name and the record involved. It wraps [ErrCodec].

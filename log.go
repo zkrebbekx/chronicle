@@ -17,7 +17,14 @@ import (
 // Log is the bitemporal engine: it turns caller assertions about what was true
 // into a non-destructive record of what was believed, and when.
 //
-// A Log is safe for concurrent use.
+// A Log is safe for concurrent use, and serializes its writes: the write path
+// holds the log's lock across the store call, so one write is in flight per
+// Log at a time, whatever entity it names. Reads never take the write lock.
+// Where write throughput across entities matters, run one Log per worker over
+// a store that assigns transaction time itself — pgstore does — which is safe
+// because the store, not any one log, orders the transaction axis. A
+// [MemStore] adopts the log's instants instead, so it must have exactly one
+// Log writing to it.
 //
 // # Transaction time
 //
@@ -325,9 +332,19 @@ func (l *Log) write(ctx context.Context, kind, entityID string, data []byte, val
 	for _, opt := range opts {
 		opt(&o)
 	}
-	for k := range o.meta {
+	for k, v := range o.meta {
 		if strings.HasPrefix(k, MetaReservedPrefix) {
 			return Result{}, fmt.Errorf("chronicle: metadata key %q: %w", k, ErrReservedMeta)
+		}
+		// NUL is rejected here, at the boundary, rather than left to the
+		// store: jsonb cannot hold a NUL inside a string, so a write MemStore
+		// accepted would fail on pgstore with a raw driver error. One
+		// behaviour, everywhere, decided by the library.
+		if strings.ContainsRune(k, 0) {
+			return Result{}, fmt.Errorf("chronicle: metadata key %q contains a NUL byte: %w", k, ErrInvalidMeta)
+		}
+		if strings.ContainsRune(v, 0) {
+			return Result{}, fmt.Errorf("chronicle: metadata value under key %q contains a NUL byte: %w", k, ErrInvalidMeta)
 		}
 	}
 	if o.subject != "" {
@@ -513,6 +530,14 @@ func (l *Log) attemptLocked(ctx context.Context, kind, entityID string, data []b
 		return Result{}, err
 	}
 
+	// Every write plans at least its own record, so a successful Apply that
+	// left the plan's inserts empty means the store never ran the plan — a
+	// contract violation that would otherwise surface as an index panic below,
+	// blamed on the log rather than the store that earned it.
+	if len(inserts) == 0 {
+		return Result{}, fmt.Errorf("chronicle: store %T reported success but did not execute the plan (Store.Apply contract violation)", l.store)
+	}
+
 	// The store has the last word on transaction time, and the ratchet is
 	// pulled forward to match so that a subsequent read's notion of "now" sits
 	// after the write that just happened rather than before it.
@@ -553,9 +578,17 @@ func (l *Log) remainderLocked(r Record, valid Interval, txNow time.Time) Record 
 
 // tickLocked returns the transaction instant for a write, applying the
 // monotonic ratchet described on [Log].
+//
+// The guard is "fails to advance", with no special case for a virgin ratchet:
+// a clock reading that does not sit strictly after lastTx becomes lastTx plus
+// one nanosecond, even when lastTx is the zero time. Exempting the first write
+// would let a zero clock reading straight through, and a zero transaction
+// instant is not a timestamp at all — stamped as TxFrom it reads as "always
+// believed", and stamped as TxTo it reads as "still current", which is how a
+// supersession quietly fails to supersede.
 func (l *Log) tickLocked() time.Time {
 	now := l.clock.Now().UTC()
-	if !l.lastTx.IsZero() && !now.After(l.lastTx) {
+	if !now.After(l.lastTx) {
 		now = l.lastTx.Add(time.Nanosecond)
 	}
 	l.lastTx = now

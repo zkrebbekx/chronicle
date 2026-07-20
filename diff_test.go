@@ -167,6 +167,26 @@ func TestDiff(t *testing.T) {
 				to:   `{"n":9007199254740992}`,
 				want: []string{`modified /n: 9007199254740993 -> 9007199254740992`},
 			},
+			{
+				// JSON does not distinguish 1 from 1.0 or 100 from 1e2, so
+				// neither does Diff: numbers compare by value, not by notation.
+				name:       "only number notation changes",
+				from:       `{"m":100,"n":1,"p":2.5,"q":0}`,
+				to:         `{"m":1e2,"n":1.0,"p":2.50,"q":-0}`,
+				wantNoDiff: true,
+			},
+			{
+				name: "numbers genuinely differ across notations",
+				from: `{"n":1.5}`,
+				to:   `{"n":2e0}`,
+				want: []string{`modified /n: 1.5 -> 2e0`},
+			},
+			{
+				name: "a number becomes the same digits as a string",
+				from: `{"n":1}`,
+				to:   `{"n":"1"}`,
+				want: []string{`modified /n: 1 -> "1"`},
+			},
 		}
 
 		for _, tc := range cases {
@@ -490,6 +510,34 @@ func TestIntentString(t *testing.T) {
 					t.Fatal("Intent(42) reported valid")
 				}
 			})
+		})
+	})
+}
+
+func TestScalarComparisonFallsBackOnUnparseableNumbers(t *testing.T) {
+	// Only a codec that hand-builds a json.Number can produce one that does not
+	// parse; encoding/json never does. The comparison then falls back to string
+	// equality, erring toward reporting a change — over-reporting is the
+	// recoverable direction for a change log.
+	t.Run("given two unparseable numbers with different text", func(t *testing.T) {
+		t.Run("then they compare unequal", func(t *testing.T) {
+			if equalScalars(json.Number("not-a-number"), json.Number("also-not")) {
+				t.Fatal("unparseable numbers compared equal; the fallback is string equality")
+			}
+		})
+	})
+	t.Run("given two unparseable numbers with identical text", func(t *testing.T) {
+		t.Run("then they compare equal", func(t *testing.T) {
+			if !equalScalars(json.Number("not-a-number"), json.Number("not-a-number")) {
+				t.Fatal("identical text compared unequal")
+			}
+		})
+	})
+	t.Run("given one parseable and one unparseable number", func(t *testing.T) {
+		t.Run("then they compare unequal", func(t *testing.T) {
+			if equalScalars(json.Number("1"), json.Number("one")) {
+				t.Fatal("a parseable and an unparseable number compared equal")
+			}
 		})
 	})
 }

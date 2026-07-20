@@ -1,6 +1,8 @@
 package chronicle
 
 import (
+	"encoding/json"
+	"math/big"
 	"reflect"
 	"slices"
 	"strings"
@@ -66,6 +68,10 @@ type Delta struct {
 	// Changes are the differences, ordered by path. It is empty when the two
 	// states are structurally identical, which is not the same as the two
 	// records being the same record.
+	//
+	// Numbers compare by value rather than by notation: 1, 1.0 and 1e0 are the
+	// same number and produce no change. Where two numbers genuinely differ,
+	// Old and New carry each side in its original notation.
 	Changes []FieldChange
 }
 
@@ -120,9 +126,35 @@ func diffValues(path string, oldVal, newVal any, out *[]FieldChange) {
 	// Either both sides are scalars, or the shape changed at this node — an
 	// object became a string, an array became a number. Both are one change at
 	// this path, carrying the whole of each side.
-	if !reflect.DeepEqual(oldVal, newVal) {
+	if !equalScalars(oldVal, newVal) {
 		*out = append(*out, FieldChange{Path: path, Op: ChangeModified, Old: oldVal, New: newVal})
 	}
+}
+
+// equalScalars compares two leaf values, treating numbers as numbers.
+//
+// [encoding/json.Number] is a string, and comparing it as one would report a
+// change of notation as a change of value: 1 versus 1.0, or 100 versus 1e2.
+// JSON does not distinguish those, so neither does Diff — numbers compare by
+// value, exactly, with no float64 round trip. A json.Number that does not
+// parse (possible only from a codec that hand-builds one) falls back to string
+// equality, which errs toward reporting a change — over-reporting is the
+// recoverable direction for a change log.
+func equalScalars(oldVal, newVal any) bool {
+	oldNum, oldIsNum := oldVal.(json.Number)
+	newNum, newIsNum := newVal.(json.Number)
+	if oldIsNum && newIsNum {
+		if oldNum == newNum {
+			return true
+		}
+		a, okA := new(big.Rat).SetString(oldNum.String())
+		b, okB := new(big.Rat).SetString(newNum.String())
+		if !okA || !okB {
+			return false
+		}
+		return a.Cmp(b) == 0
+	}
+	return reflect.DeepEqual(oldVal, newVal)
 }
 
 func diffMaps(path string, oldVal, newVal map[string]any, out *[]FieldChange) {

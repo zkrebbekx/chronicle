@@ -25,7 +25,8 @@
 //
 // Timestamps used by the suite are whole seconds, because a store may keep
 // less than nanosecond resolution: Postgres timestamptz holds microseconds.
-// A store that truncates valid times below the second is out of contract.
+// A store that cannot preserve valid times to at least whole-second precision
+// is out of contract.
 //
 // This package is a normal package rather than a test file so that stores
 // outside this module can use it, which is the whole point.
@@ -929,6 +930,37 @@ func runLog(t T, newStore Factory) {
 			t.Run("then the store's non-overlap invariant holds", func(t T) {
 				assertNoOverlap(t, s)
 			})
+		})
+
+		t.Run("when a write carries metadata no store can hold", func(t T) {
+			// A NUL byte inside a metadata key or value is unrepresentable in
+			// PostgreSQL jsonb, so the library rejects it at the write boundary
+			// for every store alike — were it left to the store, the same write
+			// would succeed in memory and fail on Postgres with a driver error.
+			s := newStore(t)
+			l := chronicle.NewLog(s)
+
+			for _, tc := range []struct {
+				name string
+				opt  chronicle.WriteOption
+			}{
+				{"a NUL byte in a key", chronicle.WithMetaValue("bad\x00key", "v")},
+				{"a NUL byte in a value", chronicle.WithMetaValue("k", "bad\x00value")},
+			} {
+				t.Run("then "+tc.name+" is rejected identically for every store", func(t T) {
+					_, err := l.Put(ctx, employee, "e-nul", []byte(`{"a":1}`), feb, time.Time{}, alice, tc.opt)
+					if !errors.Is(err, chronicle.ErrInvalidMeta) {
+						t.Fatalf("Put = %v; want ErrInvalidMeta", err)
+					}
+					recs, _, qerr := s.Query(ctx, chronicle.Query{Kind: employee, EntityID: "e-nul"})
+					if qerr != nil {
+						t.Fatalf("Query failed: %v", qerr)
+					}
+					if len(recs) != 0 {
+						t.Fatalf("the rejected write left %d records behind; want none", len(recs))
+					}
+				})
+			}
 		})
 
 		t.Run("when a belief is corrected retroactively", func(t T) {

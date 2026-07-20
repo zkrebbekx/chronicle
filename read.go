@@ -22,6 +22,12 @@ import (
 // The third is the one uni-temporal systems get wrong. They answer it with
 // today's belief about March, because a retroactive correction rewrote what
 // they appear to have known, and the answer looks entirely reasonable.
+//
+// Note the deliberate contrast with [Query]: in an As a zero field means
+// "now", while in a Query a zero time filter means "no restriction". A point
+// lookup with an unset axis is a question about the present; a scan with an
+// unset filter is a scan that does not filter, and defaulting it to the
+// present would silently hide everything superseded.
 type As struct {
 	// ValidAt is the instant on the valid axis — when in the world.
 	ValidAt time.Time
@@ -34,6 +40,12 @@ func Now() As { return As{} }
 
 // ValidAt returns an [As] at the given valid instant, at current belief.
 func ValidAt(t time.Time) As { return As{ValidAt: t} }
+
+// Believed returns an [As] at the given transaction instant, with the valid
+// instant left at "now" — what do we appear, as of that past belief, to have
+// known about the present moment. It is [ValidAt]'s mirror image: one pins the
+// world and lets belief float, the other pins belief and lets the world float.
+func Believed(tx time.Time) As { return As{TxAt: tx} }
 
 // AsOf returns an [As] at the given transaction instant, asking about the
 // state valid at that same instant — "what did the world look like to us
@@ -263,6 +275,12 @@ func (l *Log) Query(ctx context.Context, q Query) ([]Record, Cursor, error) {
 // exist, that is a [*CodecError] wrapping [ErrCodec] — never an empty diff,
 // because a change log that reports "nothing changed" when it means "I could
 // not tell" is worse than one that fails.
+//
+// Numbers are compared by value, not by notation: a field that moves from 1
+// to 1.0, or from 100 to 1e2, has not changed, because JSON does not
+// distinguish those forms. The comparison is exact — no float64 round trip —
+// so integers beyond float64's range still compare correctly. Where two
+// numbers genuinely differ, the change reports each side as written.
 func (l *Log) Diff(ctx context.Context, kind, entityID string, from, to As) (Delta, error) {
 	if err := ctx.Err(); err != nil {
 		return Delta{}, err

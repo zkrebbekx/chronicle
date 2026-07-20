@@ -3,6 +3,7 @@ package chronicle
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 )
@@ -425,6 +426,137 @@ func TestDiffSurfacesAFailureOnItsSecondOperand(t *testing.T) {
 				if !errors.Is(err, boom) {
 					t.Fatalf("Diff = %v; want the store's error — a diff that silently treats "+
 						"its second operand as absent reports every field as removed", err)
+				}
+			})
+		})
+	})
+}
+
+// planSkippingStore reports a successful Apply without ever invoking the plan,
+// which the Store contract forbids: Apply computes and applies the plan, and a
+// store that skipped it has written nothing the log asked for.
+type planSkippingStore struct{ *MemStore }
+
+func (s *planSkippingStore) Apply(context.Context, ApplyRequest) (time.Time, error) {
+	return t1, nil
+}
+
+func TestLogRejectsAStoreThatSkipsThePlan(t *testing.T) {
+	t.Run("given a store whose Apply succeeds without executing the plan", func(t *testing.T) {
+		l := NewLog(&planSkippingStore{MemStore: NewMemStore()})
+
+		t.Run("when a write is attempted", func(t *testing.T) {
+			var res Result
+			var err error
+			func() {
+				defer func() {
+					if p := recover(); p != nil {
+						t.Fatalf("Put panicked: %v — a misbehaving store must surface as an error, "+
+							"not as an index panic blamed on the log", p)
+					}
+				}()
+				res, err = l.Put(context.Background(), employee, "e1", []byte(`{"a":1}`), t0, t1, alice)
+			}()
+			t.Run("then the contract violation is reported as an error", func(t *testing.T) {
+				if err == nil {
+					t.Fatalf("Put = %+v, nil; want an error naming the store's contract violation", res)
+				}
+				if !strings.Contains(err.Error(), "did not execute the plan") {
+					t.Fatalf("Put = %v; want the error to say the store did not execute the plan", err)
+				}
+			})
+		})
+	})
+}
+
+func TestZeroClockCannotDisableTheRatchet(t *testing.T) {
+	t.Run("given a log whose clock reports the zero instant", func(t *testing.T) {
+		ctx := context.Background()
+		store := NewMemStore()
+		l := NewLog(store, WithClock(&FixedClock{}))
+
+		t.Run("when overlapping writes land", func(t *testing.T) {
+			first, err := l.Put(ctx, employee, "e1", []byte(`{"v":1}`), t1, t3, alice)
+			if err != nil {
+				t.Fatalf("first Put failed: %v", err)
+			}
+			second, err := l.Put(ctx, employee, "e1", []byte(`{"v":2}`), t1, t3, alice)
+			if err != nil {
+				t.Fatalf("second Put failed: %v", err)
+			}
+
+			t.Run("then every write still gets a nonzero transaction instant", func(t *testing.T) {
+				if first.TxAt.IsZero() || second.TxAt.IsZero() {
+					t.Fatalf("TxAt = %s then %s; a zero transaction instant stamps TxFrom as "+
+						"'always believed' and makes a supersession's TxTo read as current",
+						first.TxAt, second.TxAt)
+				}
+			})
+			t.Run("then the instants are strictly increasing", func(t *testing.T) {
+				if !second.TxAt.After(first.TxAt) {
+					t.Fatalf("TxAt did not advance: %s then %s", first.TxAt, second.TxAt)
+				}
+			})
+			t.Run("then the second write actually superseded the first", func(t *testing.T) {
+				recs, _, err := store.Query(ctx, Query{Kind: employee, EntityID: "e1", CurrentOnly: true})
+				if err != nil {
+					t.Fatalf("Query failed: %v", err)
+				}
+				if len(recs) != 1 {
+					t.Fatalf("%d current records for one fully overlapping interval; want exactly 1 — "+
+						"overlapping current belief is the invariant the library exists to hold", len(recs))
+				}
+				if string(recs[0].Data) != `{"v":2}` {
+					t.Fatalf("current data = %s; want the second write's", recs[0].Data)
+				}
+			})
+			t.Run("then the whole log still satisfies the invariants", func(t *testing.T) {
+				assertInvariants(t, store)
+			})
+		})
+	})
+}
+
+func TestWriteRejectsMetadataNoStoreCanHold(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("given metadata containing a NUL byte", func(t *testing.T) {
+		cases := []struct {
+			name string
+			opt  WriteOption
+		}{
+			{"in a key", WithMetaValue("bad\x00key", "v")},
+			{"in a value", WithMetaValue("k", "bad\x00value")},
+			{"via WithMeta", WithMeta(map[string]string{"k": "\x00"})},
+		}
+		for _, tc := range cases {
+			t.Run("when a write carries one "+tc.name, func(t *testing.T) {
+				l, store, _ := newTestLog(t)
+				_, err := l.Put(ctx, employee, "e1", []byte(`{"a":1}`), t0, t1, alice, tc.opt)
+				t.Run("then it is rejected with ErrInvalidMeta", func(t *testing.T) {
+					if !errors.Is(err, ErrInvalidMeta) {
+						t.Fatalf("Put = %v; want ErrInvalidMeta — jsonb cannot hold a NUL, so "+
+							"accepting this write would make MemStore and pgstore disagree", err)
+					}
+				})
+				t.Run("then nothing was written", func(t *testing.T) {
+					if n := store.Len(); n != 0 {
+						t.Fatalf("store holds %d records; want none", n)
+					}
+				})
+			})
+		}
+	})
+
+	t.Run("given metadata that is merely unusual", func(t *testing.T) {
+		t.Run("when a write carries control characters short of NUL", func(t *testing.T) {
+			l, _, _ := newTestLog(t)
+			_, err := l.Put(ctx, employee, "e1", []byte(`{"a":1}`), t0, t1, alice,
+				WithMetaValue("k", "tab\tand\nnewline"))
+			t.Run("then it is accepted", func(t *testing.T) {
+				if err != nil {
+					t.Fatalf("Put = %v; only NUL is unrepresentable, and rejecting more than "+
+						"necessary would be a different bug", err)
 				}
 			})
 		})

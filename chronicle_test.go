@@ -1420,16 +1420,34 @@ func TestConcurrentWrites(t *testing.T) {
 				assertInvariants(t, store)
 			})
 			t.Run("then no two writes shared a transaction instant", func(t *testing.T) {
+				// A write is one caller record (IntentAssert or IntentCorrection)
+				// plus its remainders, all stamped with one instant. Two writes
+				// sharing an instant would therefore show up as an instant
+				// carrying two non-remainder records — which is the actual claim,
+				// where the old check of record-ID uniqueness held by
+				// construction and proved nothing.
 				recs, _, err := store.Query(ctx, Query{})
 				if err != nil {
 					t.Fatalf("Query failed: %v", err)
 				}
-				ids := map[RecordID]bool{}
+				callerRecords := map[int64]int{}
 				for _, r := range recs {
-					if ids[r.ID] {
-						t.Fatalf("duplicate record ID %s under concurrency", r.ID)
+					if r.Intent == IntentRemainder {
+						continue
 					}
-					ids[r.ID] = true
+					callerRecords[r.TxFrom.UnixNano()]++
+				}
+				for instant, n := range callerRecords {
+					if n != 1 {
+						t.Fatalf("transaction instant %s carries %d non-remainder records; want "+
+							"exactly 1 — two writes shared an instant, so one superseded record "+
+							"has an empty transaction interval no as-of query can see",
+							time.Unix(0, instant).UTC(), n)
+					}
+				}
+				if len(callerRecords) != writers*perWriter {
+					t.Fatalf("%d distinct write instants for %d writes; every write must get "+
+						"its own", len(callerRecords), writers*perWriter)
 				}
 			})
 		})

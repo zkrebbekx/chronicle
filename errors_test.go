@@ -77,3 +77,27 @@ func TestCodecError(t *testing.T) {
 		})
 	})
 }
+
+func TestIntentError(t *testing.T) {
+	t.Run("given a query naming an undefined intent", func(t *testing.T) {
+		err := &IntentError{Intent: Intent(200), Err: ErrUnknownIntent}
+		t.Run("when it is rendered", func(t *testing.T) {
+			t.Run("then the message carries the offending value", func(t *testing.T) {
+				if got, want := err.Error(), "chronicle: unknown intent 200"; got != want {
+					t.Fatalf("Error() = %q; want %q", got, want)
+				}
+			})
+		})
+		t.Run("when it is matched", func(t *testing.T) {
+			t.Run("then it unwraps to its own sentinel and not the kind's", func(t *testing.T) {
+				if !errors.Is(err, ErrUnknownIntent) {
+					t.Fatalf("errors.Is(%v, ErrUnknownIntent) = false", err)
+				}
+				if errors.Is(err, ErrUnknownKind) {
+					t.Fatal("an intent error must not match ErrUnknownKind; the two name " +
+						"different caller mistakes")
+				}
+			})
+		})
+	})
+}
