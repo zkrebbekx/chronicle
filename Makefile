@@ -1,8 +1,9 @@
-.PHONY: test cover cover-pg fuzz bench lint fmt vet tidy clean help
+.PHONY: test cover cover-pg cover-chronicled fuzz bench lint fmt vet tidy clean help
 
-test: ## Run unit tests with race detector (pgstore skips without CHRONICLE_TEST_DSN)
+test: ## Run unit tests with race detector (pgstore/chronicled skip integration without CHRONICLE_TEST_DSN)
 	go test -race -timeout 120s ./...
 	cd pgstore && go test -race -timeout 300s ./...
+	cd chronicled && go test -race -timeout 300s ./...
 	cd examples && go build ./...
 
 cover: ## Run tests and open an HTML coverage report
@@ -14,6 +15,10 @@ cover-pg: ## Coverage for the Postgres adapter (needs CHRONICLE_TEST_DSN)
 	cd pgstore && go test -coverprofile=coverage.out -timeout 300s ./... && \
 		go tool cover -func=coverage.out | tail -1
 
+cover-chronicled: ## Coverage for the REST service (integration paths need CHRONICLE_TEST_DSN)
+	cd chronicled && go test -coverprofile=coverage.out -coverpkg=./... -timeout 300s ./... && \
+		go tool cover -func=coverage.out | tail -1
+
 fuzz: ## Fuzz the write path for 30s
 	go test -run=^$$ -fuzz=^FuzzPutSequence$$ -fuzztime=30s .
 
@@ -21,9 +26,10 @@ bench: ## Run benchmarks
 	go test -run=^$$ -bench=. -benchmem ./...
 	cd pgstore && go test -run=^$$ -bench=. -benchmem -benchtime=200x -timeout 600s ./...
 
-lint: ## Run golangci-lint on both modules (must be installed)
+lint: ## Run golangci-lint on every module (must be installed)
 	golangci-lint run
 	cd pgstore && golangci-lint run
+	cd chronicled && golangci-lint run
 
 fmt: ## Format code
 	gofmt -s -w .
@@ -31,15 +37,17 @@ fmt: ## Format code
 vet: ## Vet every module
 	go vet ./...
 	cd pgstore && go vet ./...
+	cd chronicled && go vet ./...
 	cd examples && go vet ./...
 
 tidy: ## Tidy modules
 	go mod tidy
 	cd pgstore && go mod tidy
+	cd chronicled && go mod tidy
 	cd examples && go mod tidy
 
 clean: ## Remove build artifacts
-	rm -rf bin coverage.out coverage.html pgstore/coverage.out
+	rm -rf bin coverage.out coverage.html pgstore/coverage.out chronicled/coverage.out
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
