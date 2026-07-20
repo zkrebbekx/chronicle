@@ -1,9 +1,9 @@
 module github.com/zkrebbekx/chronicle/chronicled
 
-go 1.24.0
+go 1.25.0
 
 require (
-	github.com/jackc/pgx/v5 v5.8.0
+	github.com/jackc/pgx/v5 v5.9.2
 	github.com/zkrebbekx/chronicle v0.1.0
 	github.com/zkrebbekx/chronicle/pgstore v0.1.0
 )
