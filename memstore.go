@@ -12,9 +12,9 @@ import (
 // for callers who want bitemporal semantics without a database, but it holds
 // the entire log in memory and never evicts, so it is not a durability story.
 //
-// It is safe for concurrent use. It also implements [Atomic], so writes made
-// through a [Log] are indivisible: a reader either sees the whole of a write —
-// every supersession and every insertion — or none of it.
+// It is safe for concurrent use, and writes are indivisible: a reader either
+// sees the whole of a write — every supersession and every insertion — or none
+// of it.
 //
 // Records are deep-copied on the way in and on the way out. A caller cannot
 // reach into the log by holding on to the Data slice or Meta map it passed to
@@ -59,46 +59,36 @@ func (s *MemStore) Close() error {
 	return nil
 }
 
-// Put implements [Store]. Prefer [MemStore.Apply], which chronicle uses
-// automatically, when the insertion accompanies a supersession.
-func (s *MemStore) Put(ctx context.Context, recs []Record) error {
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.insertLocked(recs)
-}
-
-// Supersede implements [Store]. It is idempotent: a record whose transaction
-// interval is already closed keeps the timestamp it was closed with, and an
-// unknown ID is ignored. Transaction time, once assigned, is never rewritten.
-func (s *MemStore) Supersede(ctx context.Context, ids []RecordID, txTo time.Time) error {
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.supersedeLocked(ids, txTo)
-}
-
-// Apply implements [Atomic]. The whole write happens under a single lock, so
+// Apply implements [Store]. The whole write happens under a single lock, so
 // no reader can observe the moment between closing the old records and
 // inserting the new ones — which is the moment at which an entity's valid-time
 // coverage would appear to have a hole in it.
-func (s *MemStore) Apply(ctx context.Context, w Write) error {
+//
+// MemStore accepts the log's proposed transaction instant and returns it
+// unchanged. It can: a MemStore has exactly one process writing to it, so the
+// log's ratchet is authoritative. A store shared between processes must assign
+// transaction time itself.
+func (s *MemStore) Apply(ctx context.Context, w Write) (time.Time, error) {
 	if err := ctx.Err(); err != nil {
-		return err
+		return time.Time{}, err
 	}
+	txAt := w.TxAt.UTC()
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if err := s.supersedeLocked(w.Supersede, w.TxTo); err != nil {
-		return err
+	if err := s.supersedeLocked(w.Supersede, txAt, len(w.Insert) > 0); err != nil {
+		return time.Time{}, err
 	}
-	return s.insertLocked(w.Insert)
+	if err := s.insertLocked(w.Insert, txAt); err != nil {
+		return time.Time{}, err
+	}
+	return txAt, nil
 }
 
-func (s *MemStore) insertLocked(recs []Record) error {
+// insertLocked adds records, stamping each with the write's transaction
+// instant. The stamp is not negotiable: transaction time is the store's to
+// assign, and honouring an incoming TxFrom would give callers a way to say when
+// the log appears to have learned something.
+func (s *MemStore) insertLocked(recs []Record, txFrom time.Time) error {
 	if s.closed {
 		return ErrClosed
 	}
@@ -110,6 +100,7 @@ func (s *MemStore) insertLocked(recs []Record) error {
 			continue
 		}
 		clone := r.Clone()
+		clone.TxFrom = txFrom
 		s.recs = append(s.recs, clone)
 		idx := len(s.recs) - 1
 		s.byID[clone.ID] = idx
@@ -119,16 +110,31 @@ func (s *MemStore) insertLocked(recs []Record) error {
 	return nil
 }
 
-func (s *MemStore) supersedeLocked(ids []RecordID, txTo time.Time) error {
+// supersedeLocked closes the named records' transaction intervals. It never
+// rewrites a timestamp already assigned, which is what makes a retried write
+// safe.
+//
+// strict says the write also inserts records, and so is one half of a split.
+// Finding a target already closed then means the split was planned against a
+// pre-state that has since moved, and applying the other half would leave the
+// entity's timeline overlapping. That is [ErrConflict], not a no-op. A
+// supersession on its own stays idempotent.
+func (s *MemStore) supersedeLocked(ids []RecordID, txTo time.Time, strict bool) error {
 	if s.closed {
 		return ErrClosed
 	}
 	for _, id := range ids {
 		idx, ok := s.byID[id]
 		if !ok {
+			if strict {
+				return conflictf("record %s no longer exists", id)
+			}
 			continue
 		}
 		if !s.recs[idx].TxTo.IsZero() {
+			if strict {
+				return conflictf("record %s was already superseded", id)
+			}
 			continue
 		}
 		s.recs[idx].TxTo = txTo.UTC()
@@ -247,8 +253,5 @@ func (s *MemStore) candidatesLocked(q Query) []Record {
 	return out
 }
 
-// Compile-time assertions that MemStore satisfies both contracts.
-var (
-	_ Store  = (*MemStore)(nil)
-	_ Atomic = (*MemStore)(nil)
-)
+// Compile-time assertion that MemStore satisfies the storage contract.
+var _ Store = (*MemStore)(nil)

@@ -2,6 +2,9 @@ package chronicle
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"errors"
 	"maps"
 	"strconv"
 	"strings"
@@ -42,16 +45,20 @@ import (
 // At a million writes per second that is a millisecond of drift per second of
 // writing, and it is self-correcting the moment the write rate drops.
 //
-// The ratchet is per-Log. Two Log values sharing one store will each ratchet
-// against their own history and can interleave transaction timestamps; run one
-// Log per store, or use a store whose adapter assigns transaction time
-// centrally.
+// The ratchet is per-Log, and a Log's clock is only authoritative when it is
+// the only writer. [Store.Apply] therefore returns the transaction instant it
+// actually assigned, and the log adopts it: a store shared between processes
+// stamps its own instant — from the database's clock, not any one process's —
+// and the ratchet follows along behind it. Two Log values over one Postgres
+// store consequently produce a single, correctly ordered transaction history,
+// which two independent in-process ratchets could not.
 type Log struct {
-	store Store
-	atom  Atomic
-	clock Clock
-	codec Codec
-	kinds map[string]struct{}
+	store   Store
+	clock   Clock
+	codec   Codec
+	kinds   map[string]struct{}
+	node    string
+	retries int
 
 	mu     sync.RWMutex // guards lastTx and seq; held across the whole write path
 	lastTx time.Time
@@ -101,29 +108,69 @@ func WithKinds(kinds ...string) Option {
 	}
 }
 
+// WithWriteRetries sets how many times a write is recomputed after the store
+// reports [ErrConflict]. The default is [DefaultWriteRetries]; a negative value
+// is treated as zero, which makes the first conflict fatal.
+//
+// A conflict means another writer changed the entity between this log's
+// overlap scan and its Apply. Retrying re-reads and re-splits, so the second
+// attempt plans against the state the winner left behind. Raise this where
+// contention on a single entity is expected and lower it where a caller would
+// rather fail fast than sit in a queue.
+func WithWriteRetries(n int) Option {
+	return func(l *Log) {
+		if n < 0 {
+			n = 0
+		}
+		l.retries = n
+	}
+}
+
+// DefaultWriteRetries is the number of times a write is recomputed after a
+// store reports [ErrConflict].
+const DefaultWriteRetries = 8
+
 // NewLog returns a log over the given store. It panics if store is nil, since
 // a log without storage has no meaningful degraded behaviour.
 //
-// If the store implements [Atomic], writes are applied indivisibly. If it does
-// not, chronicle falls back to a supersession followed by an insertion, which
-// a concurrent reader can observe between — acceptable for a single-threaded
-// or offline store, and not otherwise.
+// Writes are applied through [Store.Apply], indivisibly. There is no
+// non-atomic path: a supersession and the insertion it accompanies always land
+// together or not at all.
 func NewLog(store Store, opts ...Option) *Log {
 	if store == nil {
 		panic("chronicle: NewLog requires a non-nil Store")
 	}
 	l := &Log{
-		store: store,
-		clock: SystemClock,
-		codec: JSONCodec{},
-	}
-	if a, ok := store.(Atomic); ok {
-		l.atom = a
+		store:   store,
+		clock:   SystemClock,
+		codec:   JSONCodec{},
+		node:    newNodeToken(),
+		retries: DefaultWriteRetries,
 	}
 	for _, opt := range opts {
 		opt(l)
 	}
 	return l
+}
+
+// newNodeToken returns a short random token distinguishing this Log from every
+// other one, including those in other processes.
+//
+// Record IDs are minted from a transaction timestamp and a per-log sequence
+// number, and neither is unique across processes: two logs writing to one
+// Postgres store in the same nanosecond, each at the same point in its own
+// sequence, would mint the same ID, and the store's primary key would then
+// silently discard one of the two writes. The token closes that hole. It is
+// not a security boundary and does not need to be unguessable, only distinct.
+func newNodeToken() string {
+	var b [5]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		// crypto/rand does not fail on any supported platform, and a log that
+		// refused to start because of it would be worse than one whose IDs are
+		// merely time-and-sequence unique within the process.
+		return "0000000000"
+	}
+	return hex.EncodeToString(b[:])
 }
 
 // Codec returns the log's codec.
@@ -275,14 +322,44 @@ func (l *Log) write(ctx context.Context, kind, entityID string, data []byte, val
 	}
 
 	// The whole read-modify-write runs under the log's write lock. That is
-	// what makes the overlap scan and the write it computes a single
-	// decision: without it two concurrent writers to one entity could both
-	// scan the same pre-state and each split it, leaving two current records
-	// covering the same valid instant. A SQL store must obtain the equivalent
-	// from the database — see the note on [Store].
+	// what makes the overlap scan and the write it computes a single decision
+	// within this process: without it two concurrent writers to one entity
+	// could both scan the same pre-state and each split it, leaving two
+	// current records covering the same valid instant.
+	//
+	// The lock says nothing about other processes, and it cannot: the scan and
+	// the Apply are separate calls, so no store transaction spans them and no
+	// isolation level can protect the pair. A store shared between processes
+	// detects the stale pre-state instead and reports ErrConflict, which is
+	// what this loop exists to answer.
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
+	var lastConflict error
+	for attempt := 0; ; attempt++ {
+		res, err := l.attemptLocked(ctx, kind, entityID, data, valid, actor, intent, o)
+		if err == nil {
+			return res, nil
+		}
+		if !errors.Is(err, ErrConflict) {
+			return Result{}, err
+		}
+		lastConflict = err
+		if attempt >= l.retries {
+			return Result{}, &ConflictError{
+				Reason:   "lost the race for " + kind + "/" + entityID,
+				Attempts: attempt + 1,
+				Err:      lastConflict,
+			}
+		}
+	}
+}
+
+// attemptLocked is one pass of the read-modify-write: scan the overlapping
+// records, compute the split, apply it. It is separated from write so that a
+// conflict can discard the whole computation and start again from a fresh
+// scan, which is the only way to plan against state that has moved.
+func (l *Log) attemptLocked(ctx context.Context, kind, entityID string, data []byte, valid Interval, actor Actor, intent Intent, o writeOpts) (Result, error) {
 	txNow := l.tickLocked()
 
 	// No limit: the overlap set is bounded by one entity's current records,
@@ -329,13 +406,33 @@ func (l *Log) write(ctx context.Context, kind, entityID string, data []byte, val
 		}
 	}
 
-	if err := l.commit(ctx, Write{Supersede: superseded, TxTo: txNow, Insert: inserts}); err != nil {
+	txAt, err := l.store.Apply(ctx, Write{Supersede: superseded, TxAt: txNow, Insert: inserts})
+	if err != nil {
 		return Result{}, err
+	}
+
+	// The store has the last word on transaction time. Where it substituted
+	// its own instant — which any store with more than one writing process
+	// must — the records this log built carry the proposal rather than the
+	// truth, so they are restamped before anyone sees them, and the ratchet is
+	// pulled forward so that a subsequent read's notion of "now" sits after
+	// the write that just happened rather than before it.
+	txAt = txAt.UTC()
+	if txAt.IsZero() {
+		txAt = txNow
+	}
+	if txAt != txNow {
+		for i := range inserts {
+			inserts[i].TxFrom = txAt
+		}
+	}
+	if txAt.After(l.lastTx) {
+		l.lastTx = txAt
 	}
 
 	written := cloneRecords(inserts)
 	return Result{
-		TxAt:       txNow,
+		TxAt:       txAt,
 		Written:    written,
 		Superseded: superseded,
 		Record:     written[0],
@@ -360,19 +457,6 @@ func (l *Log) remainderLocked(r Record, valid Interval, txNow time.Time) Record 
 	}
 }
 
-// commit applies the write, atomically where the store can.
-func (l *Log) commit(ctx context.Context, w Write) error {
-	if l.atom != nil {
-		return l.atom.Apply(ctx, w)
-	}
-	if len(w.Supersede) > 0 {
-		if err := l.store.Supersede(ctx, w.Supersede, w.TxTo); err != nil {
-			return err
-		}
-	}
-	return l.store.Put(ctx, w.Insert)
-}
-
 // tickLocked returns the transaction instant for a write, applying the
 // monotonic ratchet described on [Log].
 func (l *Log) tickLocked() time.Time {
@@ -387,10 +471,12 @@ func (l *Log) tickLocked() time.Time {
 // nextIDLocked mints a record ID that sorts in write order. The transaction
 // instant leads so that IDs and transaction time agree; the sequence number
 // separates records written at the same instant, which is every multi-record
-// write, since a write and its remainders share one transaction time.
+// write, since a write and its remainders share one transaction time; and the
+// node token makes the result unique across processes, which neither of the
+// other two parts is.
 func (l *Log) nextIDLocked(txNow time.Time) RecordID {
 	l.seq++
-	return RecordID(txNow.Format("20060102T150405.000000000Z") + "-" + pad(l.seq, 12))
+	return RecordID(txNow.Format("20060102T150405.000000000Z") + "-" + pad(l.seq, 12) + "-" + l.node)
 }
 
 // pad renders n zero-padded to at least width digits, so that IDs minted at

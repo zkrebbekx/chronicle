@@ -2,7 +2,9 @@
 
 Bitemporal entity change history for Go. ORM-agnostic, over `database/sql`.
 
-Status: design. Nothing implemented yet.
+Status: phases 1 and 2 implemented — core model, in-memory store, Postgres
+adapter, conformance suite. Corrections found while implementing are recorded
+inline, marked **Correction**, rather than silently edited away.
 
 ## Why this exists
 
@@ -131,7 +133,7 @@ the reason every incumbent is unusable outside its own framework.
 
 ```
 type Store interface {
-    Apply(ctx context.Context, w Write) error   // atomic supersede + insert
+    Apply(ctx context.Context, w Write) (time.Time, error) // atomic supersede + insert
     Get(ctx context.Context, q GetQuery) (*Record, error)
     Query(ctx context.Context, q Query) ([]Record, Cursor, error)
 }
@@ -147,9 +149,18 @@ landing between them sees either a gap or an overlap in valid time.
 `Apply` takes the supersessions and the insertions together, so atomicity is
 expressible rather than hoped for. SQL implementations must run it in one
 transaction. Phase 1 shipped this as an optional `Atomic` extension to keep the
-original four methods; it should be promoted into `Store` proper before the
-Postgres adapter lands, because the non-atomic fallback path is a footgun that
-only looks correct in single-threaded tests.
+original four methods; **phase 2 promoted it into `Store` and deleted the
+non-atomic fallback**, because that path is a footgun that only looks correct
+in single-threaded tests.
+
+**Correction, found during phase 2: `Apply` must return the transaction
+instant.** Requirement 3 below asks for database-assigned transaction time, and
+an `Apply` returning only `error` cannot deliver it. The log builds every
+record with its own proposed `TxFrom` and reports that instant in `Result.TxAt`;
+if the store silently substitutes its own, the log hands the caller a timestamp
+that is not in the database and resolves later reads of "now" against a clock
+that is behind the log's newest record. The instant has to come back out.
+`Write.TxAt` is consequently a *proposal*, and the store has the last word.
 
 Postgres is the first adapter. It earns that by doing work chronicle would
 otherwise do badly itself:
@@ -171,9 +182,27 @@ review, and all three are correctness issues rather than tuning choices:
 2. **The read-modify-write needs real isolation.** chronicle scans the
    overlapping records *before* computing the split. Two concurrent writers to
    one entity can both observe the same pre-state and each split it, producing
-   two current records covering the same instant. The adapter must use
-   `SERIALIZABLE`, or `SELECT ... FOR UPDATE` over the entity's current
-   records. In-process mutexes do not survive a second process.
+   two current records covering the same instant. In-process mutexes do not
+   survive a second process.
+
+   **Correction, found during phase 2.** This requirement originally said the
+   adapter must use `SERIALIZABLE` or `SELECT ... FOR UPDATE`. Neither, on its
+   own, does what the requirement asks, and `SERIALIZABLE` in particular does
+   nothing at all here: the scan happens in a *different transaction* from the
+   `Apply` that acts on it, so there is no read dependency inside the write's
+   transaction for SSI to track, and both writers commit happily. Row locks
+   have the same hole — the rows are read before the locking transaction
+   begins, so the lock is taken after the decision it was meant to guard.
+
+   The hazard is not a weak isolation level; it is a read-modify-write split
+   across two store calls, which no isolation level can span. The adapter
+   therefore (a) takes a per-entity advisory lock for the duration of `Apply`
+   so writers to one entity queue rather than race, (b) re-checks inside that
+   transaction that every record it means to supersede is still current, and
+   (c) leans on the deferred exclusion constraint to catch anything (b) missed.
+   A stale plan becomes `ErrConflict`, and the log re-reads and re-splits.
+   Retry belongs above the store because only the log knows how to recompute
+   the split.
 3. **Transaction time should be assigned database-side** — a sequence, or
    `clock_timestamp()` inside a serializable transaction — rather than by the
    Go process. The in-memory implementation ratchets tx time forward per `Log`,

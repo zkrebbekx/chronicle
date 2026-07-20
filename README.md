@@ -36,8 +36,8 @@ and it needs a second axis.
 import "github.com/zkrebbekx/chronicle"
 ```
 
-> **Status: phase 1.** This is the core model and the in-memory store. The
-> Postgres adapter, the REST service, and the retention / legal-hold /
+> **Status: phase 2.** The core model, the in-memory store and the Postgres
+> adapter are in. The REST service and the retention / legal-hold /
 > tamper-evidence layer are later phases. See [docs/DESIGN.md](docs/DESIGN.md).
 
 ## The question that justifies the library
@@ -133,8 +133,15 @@ The alternative — letting timestamps tie and ordering on a separate sequence
 number — pushes the tiebreak into every reader and every downstream query.
 Ratcheting keeps it in one place. The cost is that transaction time can lead
 the wall clock by a nanosecond per write under sustained load, which
-self-corrects as soon as the write rate drops. The ratchet is per-`Log`, so run
-one `Log` per store.
+self-corrects as soon as the write rate drops.
+
+The ratchet is per-`Log`, and a `Log`'s clock is only authoritative when it is
+the only writer. `Store.Apply` therefore *owns* the transaction axis: it picks
+the instant, stamps it on everything the write inserts and closes, and returns
+it, and the log adopts whatever comes back. `MemStore` accepts the log's
+proposal because a `MemStore` has exactly one process writing to it. `pgstore`
+takes the instant from the database, so any number of processes and any number
+of `Log` values over one store still produce a single ordered history.
 
 ## Reads
 
@@ -206,28 +213,115 @@ fails.
 
 ```go
 type Store interface {
-    Put(ctx context.Context, recs []Record) error
-    Supersede(ctx context.Context, ids []RecordID, txTo time.Time) error
+    Apply(ctx context.Context, w Write) (time.Time, error)
     Get(ctx context.Context, q GetQuery) (*Record, error)
     Query(ctx context.Context, q Query) ([]Record, Cursor, error)
-}
-
-type Atomic interface { // optional, and strongly preferred
-    Apply(ctx context.Context, w Write) error
 }
 ```
 
 A write supersedes some records and inserts others, and the two must land
-together or a reader sees a gap or an overlap. The four `Store` methods cannot
-express that — `Supersede` and `Put` are separate calls with no shared
-transaction — so stores should also implement `Atomic`. chronicle uses it
-whenever it is present and falls back to a non-atomic pair when it is not.
+together or a reader sees a gap or an overlap in valid time. `Apply` carries
+both halves, and there is deliberately no way to express them separately: an
+earlier design had `Put` and `Supersede` as distinct methods with `Apply` as an
+optional extension, and the fallback path was removed because "correct as long
+as nobody else is looking" is not a property a library can check or a caller
+should have to know about.
 
-`MemStore` implements both and is safe for concurrent use. A SQL implementation
-should run `Apply` in one transaction and, because chronicle reads an entity's
-overlapping records before computing the write, should take row locks or run
-serializable so that two writers to one entity cannot both split the same
-pre-state.
+`Apply` returns the transaction instant it actually assigned. `Write.TxAt` is a
+proposal: a store with more than one writing process substitutes an instant of
+its own — no single process's clock is authoritative — and the log adopts what
+comes back.
+
+The transaction inside `Apply` cannot cover the whole read-modify-write, because
+chronicle scans the overlapping records in a *separate* call before computing
+the split. No isolation level spans two calls. A shared store instead detects
+that the pre-state moved and returns `ErrConflict`; the log re-reads, re-splits
+and retries, `DefaultWriteRetries` times by default and configurable with
+`WithWriteRetries`.
+
+`MemStore` is the reference implementation and is safe for concurrent use.
+`pgstore` is the Postgres adapter — see below.
+
+## Postgres
+
+The adapter lives in a nested module so that the root stays dependency-free:
+
+```
+go get github.com/zkrebbekx/chronicle/pgstore
+```
+
+It imports only `database/sql` and the standard library, so you bring your own
+driver. The tests use `github.com/jackc/pgx/v5/stdlib`.
+
+```go
+db, err := sql.Open("pgx", os.Getenv("DATABASE_URL"))
+store, err := pgstore.New(db, pgstore.WithSchema("audit"))
+if err := store.Migrate(ctx); err != nil { ... }
+
+log := chronicle.NewLog(store)
+```
+
+`Migrate` applies the embedded schema and is safe to run repeatedly.
+`pgstore.SchemaSQL` returns the same DDL as a string if you would rather feed it
+to your own migration tool. Both need `btree_gist`; `Migrate` creates it, which
+requires a role permitted to do so.
+
+### Schema
+
+One table per store, with both axes as `tstzrange` and `NULL` for an unbounded
+bound, matching chronicle's zero-`time.Time` convention:
+
+| column | type | notes |
+|---|---|---|
+| `id` | `text COLLATE "C"` | primary key; `C` collation so SQL ordering matches Go's byte-wise compare |
+| `kind`, `entity_id` | `text` | |
+| `data` | `bytea` | opaque, because the codec is pluggable — see below |
+| `valid_from`, `valid_to` | `timestamptz` | `NULL` = unbounded |
+| `tx_from`, `tx_to` | `timestamptz` | assigned by the database; `tx_to NULL` = current belief |
+| `valid`, `tx` | `tstzrange` | generated, stored, `[)` |
+| `actor_id`, `actor_type`, `actor_name`, `reason` | `text` | |
+| `intent` | `smallint` | |
+| `meta` | `jsonb` | always a string map, so `jsonb` is safe and indexable |
+
+`data` is `bytea`, not `jsonb`, because `Record.Data` is opaque bytes under a
+pluggable `Codec`. A `jsonb` column would silently reject every non-JSON codec
+and turn a storage adapter into a codec mandate. The "query by changed field"
+path in DESIGN.md's open questions therefore needs a JSON *projection* — a
+generated column or a side table — rather than a change of primary storage, and
+that is phase 3 work. `meta` is `jsonb` because chronicle controls its shape
+entirely.
+
+### Constraints and isolation callers inherit
+
+- **Non-overlap is structural.** An `EXCLUDE USING gist (kind =, entity_id =,
+  valid &&) WHERE (tx_to IS NULL)` constraint makes two current records covering
+  the same valid instant for one entity impossible, rather than merely checked
+  in Go. It is `DEFERRABLE INITIALLY DEFERRED` because a correct `Apply` passes
+  through an intermediate state — replacement inserted, predecessor not yet
+  closed — that a per-statement check would reject.
+- **Writes to one entity serialize.** `Apply` takes a `pg_advisory_xact_lock`
+  per `(kind, entity_id)`, sorted so that a multi-entity write cannot deadlock
+  against another ordering. Readers are never blocked.
+- **Stale plans are rejected, not applied.** Inside the same transaction `Apply`
+  re-checks that every record it means to supersede is still current, and the
+  deferred exclusion constraint catches anything the check missed. Either way
+  the result is `ErrConflict` and the log retries.
+- **Transaction time comes from the database.** `Apply` stamps
+  `GREATEST(clock_timestamp(), <entity's latest transaction instant> + 1µs)`, so
+  transaction time is strictly increasing per entity across every process
+  writing to the store. `Write.TxAt` from the log is discarded.
+- **Microsecond resolution.** `timestamptz` stores microseconds, so a
+  `time.Time` with nanosecond precision is truncated on the way in. chronicle's
+  own transaction timestamps are assigned by the database and so are already
+  microsecond-aligned; caller-supplied *valid* times are not, and round-trip
+  equality holds only to the microsecond.
+
+The isolation level is `READ COMMITTED`, deliberately. `SERIALIZABLE` is the
+usual advice, and here it would buy nothing: the read that needs protecting
+happens in a different transaction from the write, so SSI has no read dependency
+to track and would still let both writers proceed — while adding mandatory
+`40001` retry handling. The advisory lock plus in-transaction revalidation
+covers the same hazard without it.
 
 ## Compliance, honestly
 

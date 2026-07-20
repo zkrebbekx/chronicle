@@ -16,8 +16,22 @@ import (
 // monotonic ratchet would otherwise never produce.
 func seedRecords(t *testing.T, store *MemStore, recs []Record) {
 	t.Helper()
-	if err := store.Put(context.Background(), recs); err != nil {
-		t.Fatalf("seeding the store failed: %v", err)
+	// Apply owns the transaction axis and stamps every record it inserts, so
+	// seeding a fixture with hand-picked transaction times means one write per
+	// distinct instant. Grouping preserves the order records were given in,
+	// which some fixtures rely on for their IDs.
+	var order []time.Time
+	groups := make(map[time.Time][]Record)
+	for _, r := range recs {
+		if _, seen := groups[r.TxFrom]; !seen {
+			order = append(order, r.TxFrom)
+		}
+		groups[r.TxFrom] = append(groups[r.TxFrom], r)
+	}
+	for _, tx := range order {
+		if _, err := store.Apply(context.Background(), Write{TxAt: tx, Insert: groups[tx]}); err != nil {
+			t.Fatalf("seeding the store failed: %v", err)
+		}
 	}
 }
 

@@ -47,6 +47,16 @@ var (
 
 	// ErrClosed is returned by a store that has been closed.
 	ErrClosed = errors.New("chronicle: store closed")
+
+	// ErrConflict is returned by [Store.Apply] when the write was computed
+	// against a pre-state that no longer holds, because another writer changed
+	// the entity in between. Nothing is applied.
+	//
+	// It is a retryable condition rather than a failure: [Log] re-reads the
+	// entity and recomputes the split, up to a bounded number of attempts, and
+	// only surfaces the error if it keeps losing. Callers who drive a store
+	// directly should do the same.
+	ErrConflict = errors.New("chronicle: write conflict")
 )
 
 // IntervalError reports a malformed interval, carrying the offending bounds so
@@ -118,6 +128,44 @@ func (e *CodecError) Unwrap() error { return e.Err }
 // Is reports that a CodecError matches [ErrCodec], in addition to whatever the
 // wrapped error matches.
 func (e *CodecError) Is(target error) bool { return target == ErrCodec }
+
+// ConflictError reports that a write was computed against a pre-state that no
+// longer holds. It wraps [ErrConflict].
+type ConflictError struct {
+	// Reason describes what changed underneath the write.
+	Reason string
+	// Attempts is the number of times the write was retried before giving up,
+	// zero when the error comes straight from a store.
+	Attempts int
+	// Err is the underlying failure, when a store had one to report. Nil when
+	// the conflict was detected rather than reported.
+	Err error
+}
+
+// Error implements the error interface.
+func (e *ConflictError) Error() string {
+	msg := "chronicle: write conflict: " + e.Reason
+	if e.Attempts > 0 {
+		msg += " (after " + itoa(e.Attempts) + " attempts)"
+	}
+	if e.Err != nil {
+		msg += ": " + e.Err.Error()
+	}
+	return msg
+}
+
+// Unwrap returns the underlying failure, so that a store's own error remains
+// reachable with [errors.As].
+func (e *ConflictError) Unwrap() error { return e.Err }
+
+// Is reports that a ConflictError matches [ErrConflict], in addition to
+// whatever the wrapped error matches.
+func (e *ConflictError) Is(target error) bool { return target == ErrConflict }
+
+// conflictf builds a [*ConflictError] with a formatted reason.
+func conflictf(format string, args ...any) error {
+	return &ConflictError{Reason: fmt.Sprintf(format, args...)}
+}
 
 // NotFoundError reports that no record satisfied a lookup, carrying the
 // coordinates that were searched. It wraps [ErrNotFound].

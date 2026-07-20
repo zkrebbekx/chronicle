@@ -9,19 +9,57 @@ import (
 	"time"
 )
 
-// basicStore wraps a MemStore but deliberately does not implement [Atomic], so
-// that the log's fallback path — Supersede followed by Put — is exercised.
-type basicStore struct{ inner *MemStore }
-
-func (s *basicStore) Put(ctx context.Context, recs []Record) error { return s.inner.Put(ctx, recs) }
-func (s *basicStore) Supersede(ctx context.Context, ids []RecordID, txTo time.Time) error {
-	return s.inner.Supersede(ctx, ids, txTo)
+// stampingStore wraps a MemStore and substitutes its own transaction instant
+// for the log's proposal, the way a store shared between processes must. It
+// stands in for the Postgres adapter in the root module's tests, so that the
+// log's handling of a store-assigned transaction time is covered without a
+// database.
+type stampingStore struct {
+	inner *MemStore
+	mu    sync.Mutex
+	next  time.Time
 }
-func (s *basicStore) Get(ctx context.Context, q GetQuery) (*Record, error) {
+
+func newStampingStore(start time.Time) *stampingStore {
+	return &stampingStore{inner: NewMemStore(), next: start}
+}
+
+func (s *stampingStore) Apply(ctx context.Context, w Write) (time.Time, error) {
+	s.mu.Lock()
+	s.next = s.next.Add(time.Hour)
+	stamped := s.next
+	s.mu.Unlock()
+
+	w.TxAt = stamped
+	for i := range w.Insert {
+		w.Insert[i].TxFrom = stamped
+	}
+	return s.inner.Apply(ctx, w)
+}
+
+func (s *stampingStore) Get(ctx context.Context, q GetQuery) (*Record, error) {
 	return s.inner.Get(ctx, q)
 }
-func (s *basicStore) Query(ctx context.Context, q Query) ([]Record, Cursor, error) {
+
+func (s *stampingStore) Query(ctx context.Context, q Query) ([]Record, Cursor, error) {
 	return s.inner.Query(ctx, q)
+}
+
+// conflictStore fails a fixed number of writes with ErrConflict before letting
+// them through, standing in for a rival writer that keeps winning the race.
+type conflictStore struct {
+	Store
+	remaining int
+	attempts  int
+}
+
+func (s *conflictStore) Apply(ctx context.Context, w Write) (time.Time, error) {
+	s.attempts++
+	if s.remaining > 0 {
+		s.remaining--
+		return time.Time{}, conflictf("record %s was already superseded", "elsewhere")
+	}
+	return s.Store.Apply(ctx, w)
 }
 
 func TestMemStore(t *testing.T) {
@@ -62,8 +100,8 @@ func TestMemStore(t *testing.T) {
 			t.Run("then the original is kept rather than overwritten", func(t *testing.T) {
 				dup := rec
 				dup.Data = []byte("overwritten")
-				if err := s.Put(ctx, []Record{dup}); err != nil {
-					t.Fatalf("Put failed: %v", err)
+				if _, err := s.Apply(ctx, Write{Insert: []Record{dup}}); err != nil {
+					t.Fatalf("Apply failed: %v", err)
 				}
 				if s.Len() != 1 {
 					t.Fatalf("Len() = %d; want 1 — a duplicate ID must not add a row", s.Len())
@@ -79,8 +117,8 @@ func TestMemStore(t *testing.T) {
 		})
 
 		t.Run("when it is superseded", func(t *testing.T) {
-			if err := s.Supersede(ctx, []RecordID{"r1"}, t2); err != nil {
-				t.Fatalf("Supersede failed: %v", err)
+			if _, err := s.Apply(ctx, Write{Supersede: []RecordID{"r1"}, TxAt: t2}); err != nil {
+				t.Fatalf("Apply failed: %v", err)
 			}
 			t.Run("then its transaction interval is closed", func(t *testing.T) {
 				recs, _, err := s.Query(ctx, Query{})
@@ -92,8 +130,8 @@ func TestMemStore(t *testing.T) {
 				}
 			})
 			t.Run("then superseding again is idempotent", func(t *testing.T) {
-				if err := s.Supersede(ctx, []RecordID{"r1"}, t4); err != nil {
-					t.Fatalf("Supersede failed: %v", err)
+				if _, err := s.Apply(ctx, Write{Supersede: []RecordID{"r1"}, TxAt: t4}); err != nil {
+					t.Fatalf("Apply failed: %v", err)
 				}
 				recs, _, err := s.Query(ctx, Query{})
 				if err != nil {
@@ -105,8 +143,123 @@ func TestMemStore(t *testing.T) {
 				}
 			})
 			t.Run("then superseding an unknown ID is not an error", func(t *testing.T) {
-				if err := s.Supersede(ctx, []RecordID{"nope"}, t4); err != nil {
-					t.Fatalf("Supersede of an unknown ID = %v; want nil", err)
+				if _, err := s.Apply(ctx, Write{Supersede: []RecordID{"nope"}, TxAt: t4}); err != nil {
+					t.Fatalf("Apply of an unknown ID = %v; want nil", err)
+				}
+			})
+			t.Run("then the same supersession alongside an insert is a conflict", func(t *testing.T) {
+				_, err := s.Apply(ctx, Write{
+					Supersede: []RecordID{"r1"},
+					TxAt:      t4,
+					Insert:    []Record{{ID: "r2", Kind: employee, EntityID: "e", TxFrom: t4, Actor: alice}},
+				})
+				if !errors.Is(err, ErrConflict) {
+					t.Fatalf("Apply = %v; want ErrConflict — a split planned against a record "+
+						"someone else already superseded must not land half-applied", err)
+				}
+				if s.Len() != 1 {
+					t.Fatalf("Len() = %d; want 1 — a conflicting write must insert nothing", s.Len())
+				}
+			})
+			t.Run("then an unknown supersession alongside an insert is a conflict too", func(t *testing.T) {
+				_, err := s.Apply(ctx, Write{
+					Supersede: []RecordID{"nope"},
+					TxAt:      t4,
+					Insert:    []Record{{ID: "r3", Kind: employee, EntityID: "e", TxFrom: t4, Actor: alice}},
+				})
+				if !errors.Is(err, ErrConflict) {
+					t.Fatalf("Apply = %v; want ErrConflict", err)
+				}
+			})
+		})
+	})
+
+	t.Run("given a store that assigns transaction time itself", func(t *testing.T) {
+		s := newStampingStore(t1)
+		l := NewLog(s, WithClock(NewFixedClock(t0)))
+
+		t.Run("when writes are made through a log", func(t *testing.T) {
+			first, err := l.Put(ctx, employee, "e", []byte("v1"), t1, time.Time{}, alice)
+			if err != nil {
+				t.Fatalf("Put failed: %v", err)
+			}
+			second, err := l.Put(ctx, employee, "e", []byte("v2"), t1, time.Time{}, bob)
+			if err != nil {
+				t.Fatalf("Put failed: %v", err)
+			}
+
+			t.Run("then the log reports the store's instant, not its own clock", func(t *testing.T) {
+				if !first.TxAt.Equal(t1.Add(time.Hour)) {
+					t.Fatalf("TxAt = %s; want the store's %s", first.TxAt, t1.Add(time.Hour))
+				}
+				if !second.TxAt.After(first.TxAt) {
+					t.Fatalf("TxAt did not advance: %s then %s", first.TxAt, second.TxAt)
+				}
+			})
+			t.Run("then the returned records carry the store's instant", func(t *testing.T) {
+				for _, r := range second.Written {
+					if !r.TxFrom.Equal(second.TxAt) {
+						t.Fatalf("record %s has TxFrom %s; want %s", r.ID, r.TxFrom, second.TxAt)
+					}
+				}
+			})
+			t.Run("then reads resolve now against the store's instant", func(t *testing.T) {
+				got, err := l.Get(ctx, employee, "e", Now())
+				if err != nil {
+					t.Fatalf("Get failed: %v", err)
+				}
+				if string(got.Data) != "v2" {
+					t.Fatalf("data = %s; want v2 — a read must see a write the store has "+
+						"stamped ahead of the local clock", got.Data)
+				}
+			})
+			t.Run("then the transaction axis is left without gaps or overlaps", func(t *testing.T) {
+				assertInvariants(t, s.inner)
+			})
+		})
+	})
+
+	t.Run("given a store that reports conflicts", func(t *testing.T) {
+		t.Run("when the conflicts stop within the retry budget", func(t *testing.T) {
+			s := &conflictStore{Store: NewMemStore(), remaining: 2}
+			l := NewLog(s, WithClock(NewFixedClock(t0)))
+			t.Run("then the write eventually lands", func(t *testing.T) {
+				if _, err := l.Put(ctx, employee, "e", []byte("v"), t1, t3, alice); err != nil {
+					t.Fatalf("Put = %v; want the retry to succeed", err)
+				}
+				if s.attempts != 3 {
+					t.Fatalf("attempts = %d; want 3", s.attempts)
+				}
+			})
+		})
+
+		t.Run("when the conflicts outlast the retry budget", func(t *testing.T) {
+			s := &conflictStore{Store: NewMemStore(), remaining: 100}
+			l := NewLog(s, WithClock(NewFixedClock(t0)), WithWriteRetries(2))
+			t.Run("then the write reports a conflict naming the entity", func(t *testing.T) {
+				_, err := l.Put(ctx, employee, "e", []byte("v"), t1, t3, alice)
+				if !errors.Is(err, ErrConflict) {
+					t.Fatalf("Put = %v; want ErrConflict", err)
+				}
+				var ce *ConflictError
+				if !errors.As(err, &ce) || ce.Attempts != 3 {
+					t.Fatalf("error = %v; want a *ConflictError after 3 attempts", err)
+				}
+				if s.attempts != 3 {
+					t.Fatalf("attempts = %d; want 3 — the budget is retries beyond the first try", s.attempts)
+				}
+			})
+		})
+
+		t.Run("when retries are disabled", func(t *testing.T) {
+			s := &conflictStore{Store: NewMemStore(), remaining: 1}
+			l := NewLog(s, WithClock(NewFixedClock(t0)), WithWriteRetries(-1))
+			t.Run("then the first conflict is fatal", func(t *testing.T) {
+				if _, err := l.Put(ctx, employee, "e", []byte("v"), t1, t3, alice); !errors.Is(err, ErrConflict) {
+					t.Fatalf("Put = %v; want ErrConflict", err)
+				}
+				if s.attempts != 1 {
+					t.Fatalf("attempts = %d; want 1", s.attempts)
 				}
 			})
 		})
@@ -121,13 +274,13 @@ func TestMemStore(t *testing.T) {
 
 		t.Run("when it is used afterwards", func(t *testing.T) {
 			t.Run("then every operation reports ErrClosed", func(t *testing.T) {
-				if err := s.Put(ctx, []Record{{ID: "r2"}}); !errors.Is(err, ErrClosed) {
-					t.Fatalf("Put = %v; want ErrClosed", err)
+				if _, err := s.Apply(ctx, Write{Insert: []Record{{ID: "r2"}}}); !errors.Is(err, ErrClosed) {
+					t.Fatalf("Apply = %v; want ErrClosed", err)
 				}
-				if err := s.Supersede(ctx, []RecordID{"r1"}, t2); !errors.Is(err, ErrClosed) {
-					t.Fatalf("Supersede = %v; want ErrClosed", err)
+				if _, err := s.Apply(ctx, Write{Supersede: []RecordID{"r1"}, TxAt: t2}); !errors.Is(err, ErrClosed) {
+					t.Fatalf("Apply = %v; want ErrClosed", err)
 				}
-				if err := s.Apply(ctx, Write{}); !errors.Is(err, ErrClosed) {
+				if _, err := s.Apply(ctx, Write{}); !errors.Is(err, ErrClosed) {
 					t.Fatalf("Apply = %v; want ErrClosed", err)
 				}
 				if _, err := s.Get(ctx, GetQuery{}); !errors.Is(err, ErrClosed) {
@@ -151,13 +304,7 @@ func TestMemStore(t *testing.T) {
 		cancel()
 		t.Run("when the store is used", func(t *testing.T) {
 			t.Run("then every operation reports the context error", func(t *testing.T) {
-				if err := s.Put(cancelled, nil); !errors.Is(err, context.Canceled) {
-					t.Fatalf("Put = %v; want context.Canceled", err)
-				}
-				if err := s.Supersede(cancelled, nil, t1); !errors.Is(err, context.Canceled) {
-					t.Fatalf("Supersede = %v; want context.Canceled", err)
-				}
-				if err := s.Apply(cancelled, Write{}); !errors.Is(err, context.Canceled) {
+				if _, err := s.Apply(cancelled, Write{}); !errors.Is(err, context.Canceled) {
 					t.Fatalf("Apply = %v; want context.Canceled", err)
 				}
 				if _, err := s.Get(cancelled, GetQuery{}); !errors.Is(err, context.Canceled) {
@@ -253,8 +400,11 @@ func TestMemStore(t *testing.T) {
 		}
 	})
 
-	t.Run("given a store that cannot apply writes atomically", func(t *testing.T) {
-		store := &basicStore{inner: NewMemStore()}
+	t.Run("given a store reached only through the Store interface", func(t *testing.T) {
+		// The log holds a Store and nothing more: there is no longer an
+		// optional atomic extension to detect, and so no path by which a write
+		// can be split into two calls.
+		var store Store = NewMemStore()
 		l := NewLog(store, WithClock(NewFixedClock(t0)))
 
 		t.Run("when writes are made through it", func(t *testing.T) {
@@ -265,7 +415,7 @@ func TestMemStore(t *testing.T) {
 				t.Fatalf("Put failed: %v", err)
 			}
 
-			t.Run("then the fallback path still produces a correct tiling", func(t *testing.T) {
+			t.Run("then the split produces a correct tiling", func(t *testing.T) {
 				want := []string{
 					"[2026-02-01T00:00:00Z, 2026-03-01T00:00:00Z)=v1",
 					"[2026-03-01T00:00:00Z, 2026-04-01T00:00:00Z)=v2",
@@ -276,7 +426,7 @@ func TestMemStore(t *testing.T) {
 				}
 			})
 			t.Run("then every invariant still holds", func(t *testing.T) {
-				assertInvariants(t, store.inner)
+				assertInvariants(t, store.(*MemStore))
 			})
 		})
 	})
@@ -292,8 +442,8 @@ func TestMemStore(t *testing.T) {
 				defer wg.Done()
 				for i := 0; i < 50; i++ {
 					id := RecordID(fmt.Sprintf("w%d-%d", w, i))
-					err := s.Apply(context.Background(), Write{
-						TxTo: t2,
+					_, err := s.Apply(context.Background(), Write{
+						TxAt: t2,
 						Insert: []Record{{
 							ID: id, Kind: employee, EntityID: fmt.Sprintf("e%d", i%3),
 							Data: []byte("v"), ValidFrom: t1, ValidTo: t3, TxFrom: t1, Actor: alice,
@@ -335,6 +485,84 @@ func TestMemStore(t *testing.T) {
 			t.Run("then every record landed exactly once", func(t *testing.T) {
 				if s.Len() != 6*50 {
 					t.Fatalf("Len() = %d; want %d", s.Len(), 6*50)
+				}
+			})
+		})
+	})
+}
+
+func TestWriteEntities(t *testing.T) {
+	t.Run("given a write touching several entities", func(t *testing.T) {
+		w := Write{Insert: []Record{
+			{Kind: "invoice", EntityID: "i1"},
+			{Kind: "employee", EntityID: "e2"},
+			{Kind: "employee", EntityID: "e1"},
+			{Kind: "employee", EntityID: "e2"},
+		}}
+
+		t.Run("when its entities are listed", func(t *testing.T) {
+			got := w.Entities()
+			t.Run("then each appears once, in a deterministic order", func(t *testing.T) {
+				want := []EntityRef{
+					{Kind: "employee", EntityID: "e1"},
+					{Kind: "employee", EntityID: "e2"},
+					{Kind: "invoice", EntityID: "i1"},
+				}
+				if len(got) != len(want) {
+					t.Fatalf("Entities() = %v; want %v", got, want)
+				}
+				for i := range want {
+					if got[i] != want[i] {
+						t.Fatalf("Entities() = %v; want %v", got, want)
+					}
+				}
+			})
+		})
+	})
+
+	t.Run("given a write that inserts nothing", func(t *testing.T) {
+		t.Run("when its entities are listed", func(t *testing.T) {
+			t.Run("then the list is empty, because an ID does not name its entity", func(t *testing.T) {
+				if got := (Write{Supersede: []RecordID{"r1"}}).Entities(); len(got) != 0 {
+					t.Fatalf("Entities() = %v; want none", got)
+				}
+			})
+		})
+	})
+}
+
+func TestConflictErrorFormatting(t *testing.T) {
+	t.Run("given a conflict reported straight from a store", func(t *testing.T) {
+		err := conflictf("record %s was already superseded", "r1")
+		t.Run("when it is rendered", func(t *testing.T) {
+			t.Run("then it names the record and no attempt count", func(t *testing.T) {
+				want := "chronicle: write conflict: record r1 was already superseded"
+				if err.Error() != want {
+					t.Fatalf("Error() = %q; want %q", err, want)
+				}
+			})
+			t.Run("then it matches ErrConflict", func(t *testing.T) {
+				if !errors.Is(err, ErrConflict) {
+					t.Fatal("a ConflictError should match ErrConflict")
+				}
+			})
+		})
+	})
+
+	t.Run("given a conflict raised after exhausting retries", func(t *testing.T) {
+		inner := conflictf("record r1 was already superseded")
+		err := &ConflictError{Reason: "lost the race for employee/e", Attempts: 3, Err: inner}
+		t.Run("when it is rendered", func(t *testing.T) {
+			t.Run("then it reports the attempts and the underlying reason", func(t *testing.T) {
+				want := "chronicle: write conflict: lost the race for employee/e (after 3 attempts): " +
+					"chronicle: write conflict: record r1 was already superseded"
+				if err.Error() != want {
+					t.Fatalf("Error() = %q; want %q", err, want)
+				}
+			})
+			t.Run("then the store's own error stays reachable", func(t *testing.T) {
+				if errors.Unwrap(err) != inner {
+					t.Fatal("the wrapped store error should remain reachable")
 				}
 			})
 		})

@@ -2,6 +2,7 @@ package chronicle
 
 import (
 	"context"
+	"slices"
 	"strings"
 	"time"
 )
@@ -23,31 +24,45 @@ import (
 // observable half-applied, or a reader will see either a gap or an overlap in
 // valid time, which is exactly the invariant the library exists to hold.
 //
-// The four methods here cannot express that: Supersede and Put are separate
-// calls with no shared transaction. A store that only implements Store is
-// therefore driven with Supersede followed by Put, which is *not* atomic and
-// is suitable only where no concurrent reader can observe the gap.
+// [Store.Apply] therefore carries both halves of a write, and there is no way
+// to express the halves separately. An earlier design had Put and Supersede as
+// distinct methods with Apply as an optional extension; that shape was removed
+// because the fallback path — supersede, then insert, with no shared
+// transaction — is only correct when nobody else is looking, which is a
+// property no library can check and every caller assumes.
 //
-// Implementations should also implement [Atomic], whose single Apply method
-// carries both halves of the write. chronicle uses it whenever the store
-// provides it. A database/sql implementation should run Apply's supersessions
-// and inserts in one transaction; because chronicle reads the overlapping
-// records before computing the write, that transaction should also be
-// serializable, or should have taken row locks over the entity's current
-// records, so that two concurrent writers to one entity cannot both compute
-// their splits against the same pre-state.
+// # Isolation
+//
+// chronicle reads an entity's overlapping records, computes a split, and then
+// calls Apply. Those two steps are separate calls, so an implementation cannot
+// protect the read with the write's transaction. It must instead detect that
+// the pre-state changed underneath it and report [ErrConflict]; [Log] retries
+// the whole read-modify-write when it sees one. Implementations backed by a
+// database should take a per-entity lock for the duration of Apply and rely on
+// a deferrable exclusion constraint to catch anything the lock missed.
 type Store interface {
-	// Put inserts records. Records are inserted as given; the store assigns
-	// nothing and validates nothing temporal. Implementations must copy any
-	// mutable state they retain.
-	Put(ctx context.Context, recs []Record) error
-
-	// Supersede closes the transaction interval of the identified records by
-	// setting TxTo. Records already closed must be left alone rather than
-	// re-closed, and unknown IDs are not an error — supersession is
-	// idempotent, so that a retried write cannot rewrite a transaction
-	// timestamp that has already been assigned.
-	Supersede(ctx context.Context, ids []RecordID, txTo time.Time) error
+	// Apply performs the whole of a write: it closes the transaction interval
+	// of every record named in Supersede, then inserts every record in Insert.
+	// Either all of it is visible to a subsequent read, or none of it is.
+	//
+	// Apply owns the transaction axis. It picks one instant for the write,
+	// stamps it on every inserted record's TxFrom and every superseded
+	// record's TxTo, and returns it. Whatever TxFrom an inserted record
+	// arrives carrying is overwritten, so there is no path by which a caller
+	// can choose when the log appears to have learned something — which is the
+	// only reason the transaction axis is worth trusting.
+	//
+	// Write.TxAt is a proposal. A single-writer store may adopt it; a store
+	// with more than one writing process must not, since no one process's
+	// clock is authoritative, and takes the instant from somewhere both
+	// writers agree on instead. [Log] treats the returned instant as the
+	// truth either way.
+	//
+	// Apply reports an error wrapping [ErrConflict] when the write was
+	// computed against a pre-state that no longer holds — typically because a
+	// record it meant to supersede has already been superseded by someone
+	// else. Nothing is applied in that case.
+	Apply(ctx context.Context, w Write) (time.Time, error)
 
 	// Get returns the single record covering the given point on both axes, or
 	// an error wrapping [ErrNotFound]. Where the log's invariant holds, at
@@ -60,30 +75,67 @@ type Store interface {
 	Query(ctx context.Context, q Query) ([]Record, Cursor, error)
 }
 
-// Atomic is an optional extension to [Store] for implementations that can
-// apply a supersession and an insertion as one indivisible operation.
-//
-// chronicle checks for it on every write and prefers it when present. Any
-// store intended for concurrent use should implement it; [MemStore] does.
-type Atomic interface {
-	// Apply performs the whole of a write: it closes the transaction interval
-	// of every record named in Supersede, then inserts every record in Insert.
-	// Either all of it is visible to a subsequent read, or none of it is.
-	Apply(ctx context.Context, w Write) error
-}
-
-// Write is one indivisible unit of change, as handed to [Atomic.Apply].
+// Write is one indivisible unit of change, as handed to [Store.Apply].
 type Write struct {
 	// Supersede names the records whose transaction interval is to be closed.
+	// A record already closed keeps the timestamp it was closed with:
+	// transaction time, once assigned, is never rewritten.
+	//
+	// Whether a target that is missing or already closed is an error depends
+	// on what else the write does. On its own, a supersession is idempotent
+	// and such a target is ignored, so that a retry cannot rewrite a
+	// transaction timestamp. Alongside insertions it is one half of a split,
+	// and a target that has moved means the split was planned against a
+	// pre-state that no longer holds — applying the other half would leave the
+	// entity's valid timeline overlapping — so the store reports [ErrConflict]
+	// and applies nothing.
 	Supersede []RecordID
-	// TxTo is the instant at which to close them. It equals the TxFrom of
-	// every record in Insert, so that the belief transition happens at a
-	// single point on the transaction axis with no gap and no overlap.
-	TxTo time.Time
+	// TxAt is the transaction instant the log proposes for the write: the TxTo
+	// of everything superseded and the TxFrom of everything inserted, so that
+	// the belief transition happens at a single point on the transaction axis
+	// with no gap and no overlap.
+	//
+	// It is a proposal. The store picks the instant it actually uses, applies
+	// it to both halves of the write, and returns it — see [Store.Apply].
+	TxAt time.Time
 	// Insert holds the records to add: the caller's new record, plus any
 	// remainders preserving the parts of superseded intervals the new record
 	// did not cover.
 	Insert []Record
+}
+
+// Entities returns the distinct (kind, entity) pairs a write touches, as
+// implied by the records it inserts, in a deterministic order.
+//
+// Store implementations use it to decide what to lock. It cannot see entities
+// named only by Supersede, since a record ID does not carry its entity; a
+// store that needs those must look them up.
+func (w Write) Entities() []EntityRef {
+	seen := make(map[EntityRef]struct{}, len(w.Insert))
+	out := make([]EntityRef, 0, len(w.Insert))
+	for _, r := range w.Insert {
+		ref := EntityRef{Kind: r.Kind, EntityID: r.EntityID}
+		if _, ok := seen[ref]; ok {
+			continue
+		}
+		seen[ref] = struct{}{}
+		out = append(out, ref)
+	}
+	slices.SortFunc(out, func(a, b EntityRef) int {
+		if c := strings.Compare(a.Kind, b.Kind); c != 0 {
+			return c
+		}
+		return strings.Compare(a.EntityID, b.EntityID)
+	})
+	return out
+}
+
+// EntityRef names one entity: a kind and an ID within that kind.
+type EntityRef struct {
+	// Kind discriminates the type of entity.
+	Kind string
+	// EntityID is the caller's opaque identifier, scoped by Kind.
+	EntityID string
 }
 
 // GetQuery locates a single record by its coordinates on both time axes.

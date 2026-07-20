@@ -137,23 +137,29 @@
 // lock-holding iterators, and a limit and cursor that push down into LIMIT and
 // a keyset predicate.
 //
-// Supersession must be atomic with the writes accompanying it. The four Store
-// methods cannot express that, since Supersede and Put are separate calls, so
-// stores should also implement [Atomic], whose single Apply carries both
-// halves of a write; chronicle uses it whenever it is available and falls back
-// to a non-atomic pair when it is not. A SQL implementation should run Apply
-// in one transaction, and — because chronicle reads an entity's overlapping
-// records before computing the write — should take row locks or run
-// serializable, so two writers to one entity cannot both split the same
-// pre-state.
+// Supersession must be atomic with the writes accompanying it, so [Store.Apply]
+// carries both halves and there is no way to express them separately. A SQL
+// implementation runs Apply in one transaction.
+//
+// That transaction cannot cover the whole read-modify-write, though, because
+// chronicle reads an entity's overlapping records in a separate call before it
+// computes the split. No isolation level reaches across two calls. A store
+// shared between processes therefore detects that the pre-state moved and
+// reports [ErrConflict]; the log re-reads, re-splits and tries again, up to
+// [DefaultWriteRetries] times. See [WithWriteRetries].
+//
+// Apply also returns the transaction instant it assigned, which a store with
+// more than one writing process must take from somewhere central rather than
+// from any one process's clock. The log adopts whatever comes back.
 //
 // # Errors
 //
 // Match errors with [errors.Is] against [ErrNotFound], [ErrInvalidInterval],
 // [ErrMissingActor], [ErrUnknownKind], [ErrCodec], [ErrInvalidCursor],
-// [ErrMissingEntityID] and [ErrClosed]. Where extra context helps, the
-// concrete error is also available via [errors.As]: [*IntervalError],
-// [*KindError], [*CodecError], [*NotFoundError] and [*CursorError].
+// [ErrMissingEntityID], [ErrClosed] and [ErrConflict]. Where extra context
+// helps, the concrete error is also available via [errors.As]:
+// [*IntervalError], [*KindError], [*CodecError], [*NotFoundError],
+// [*CursorError] and [*ConflictError].
 //
 // # Concurrency
 //

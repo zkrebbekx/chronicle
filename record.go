@@ -10,10 +10,24 @@ import (
 //
 // IDs are assigned by chronicle, never by the caller. The format is an
 // implementation detail and callers must treat an ID as opaque, but two
-// properties are guaranteed and relied upon internally: an ID is unique within
-// a log, and IDs sort lexicographically in the order the records were written.
-// The second property is what gives queries a deterministic total order even
-// when two records share a transaction instant.
+// properties are guaranteed and relied upon internally.
+//
+// The first is uniqueness, which holds across processes as well as within one:
+// two logs writing to the same store never mint the same ID, so a store's
+// primary key cannot silently swallow one of two concurrent writes.
+//
+// The second is that IDs minted by one log sort lexicographically in write
+// order, which is what breaks the remaining tie in chronicle's total order.
+// The tie only ever arises between records sharing both a transaction instant
+// and a valid start, and the records that do share a transaction instant are
+// the ones written together — a write and its remainders — so a within-log
+// ordering is enough. Across logs the ordering is arbitrary but stable, which
+// is all pagination needs.
+//
+// Note in particular that ID order does not track transaction time across
+// processes. A store that assigns transaction time itself, as any store with
+// more than one writing process must, stamps an instant the minting log had
+// not seen. Compare records with their transaction times, never by ID.
 type RecordID string
 
 // Actor identifies who caused a change. It is required on every write.
