@@ -562,3 +562,87 @@ func TestWriteRejectsMetadataNoStoreCanHold(t *testing.T) {
 		})
 	})
 }
+
+func TestWriteRejectsTextFieldsNoStoreCanHold(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("given a caller-supplied text field containing a NUL byte", func(t *testing.T) {
+		cases := []struct {
+			name string
+			put  func(l *Log) (Result, error)
+		}{
+			{"the kind", func(l *Log) (Result, error) {
+				return l.Put(ctx, "k\x00ind", "e1", []byte(`{"a":1}`), t0, t1, alice)
+			}},
+			{"the entity ID", func(l *Log) (Result, error) {
+				return l.Put(ctx, employee, "e\x001", []byte(`{"a":1}`), t0, t1, alice)
+			}},
+			{"the actor ID", func(l *Log) (Result, error) {
+				return l.Put(ctx, employee, "e1", []byte(`{"a":1}`), t0, t1, Actor{ID: "u\x001"})
+			}},
+			{"the actor type", func(l *Log) (Result, error) {
+				return l.Put(ctx, employee, "e1", []byte(`{"a":1}`), t0, t1, Actor{ID: "u1", Type: "hu\x00man"})
+			}},
+			{"the actor name", func(l *Log) (Result, error) {
+				return l.Put(ctx, employee, "e1", []byte(`{"a":1}`), t0, t1, Actor{ID: "u1", Name: "A\x00lice"})
+			}},
+			{"the reason", func(l *Log) (Result, error) {
+				return l.Put(ctx, employee, "e1", []byte(`{"a":1}`), t0, t1, alice, WithReason("wh\x00y"))
+			}},
+		}
+		for _, tc := range cases {
+			t.Run("when a write carries one in "+tc.name, func(t *testing.T) {
+				l, store, _ := newTestLog(t)
+				_, err := tc.put(l)
+				t.Run("then it is rejected with ErrInvalidField", func(t *testing.T) {
+					if !errors.Is(err, ErrInvalidField) {
+						t.Fatalf("Put = %v; want ErrInvalidField — a text column cannot hold a NUL, "+
+							"so accepting this write would make MemStore and pgstore disagree", err)
+					}
+				})
+				t.Run("then nothing was written", func(t *testing.T) {
+					if n := store.Len(); n != 0 {
+						t.Fatalf("store holds %d records; want none", n)
+					}
+				})
+			})
+		}
+	})
+
+	t.Run("given a hold whose text fields carry a NUL byte", func(t *testing.T) {
+		cases := []struct {
+			name string
+			hold Hold
+		}{
+			{"the hold ID", Hold{ID: "h\x001", PlacedBy: alice}},
+			{"the scope kind", Hold{ID: "h1", Kind: "k\x00", PlacedBy: alice}},
+			{"the scope entity ID", Hold{ID: "h1", EntityID: "e\x00", PlacedBy: alice}},
+			{"the reason", Hold{ID: "h1", Reason: "r\x00", PlacedBy: alice}},
+			{"the actor name", Hold{ID: "h1", PlacedBy: Actor{ID: "u1", Name: "A\x00"}}},
+		}
+		for _, tc := range cases {
+			t.Run("when Validate sees one in "+tc.name, func(t *testing.T) {
+				err := tc.hold.Validate()
+				t.Run("then it is rejected with ErrInvalidField", func(t *testing.T) {
+					if !errors.Is(err, ErrInvalidField) {
+						t.Fatalf("Validate = %v; want ErrInvalidField", err)
+					}
+				})
+			})
+		}
+	})
+
+	t.Run("given fields that are merely unusual", func(t *testing.T) {
+		t.Run("when a write carries unicode and control characters short of NUL", func(t *testing.T) {
+			l, _, _ := newTestLog(t)
+			_, err := l.Put(ctx, employee, "e1", []byte(`{"a":1}`), t0, t1,
+				Actor{ID: "u1", Name: "Ålice\ttab"}, WithReason("line\nbreak"))
+			t.Run("then it is accepted", func(t *testing.T) {
+				if err != nil {
+					t.Fatalf("Put = %v; only NUL is unrepresentable, and rejecting more than "+
+						"necessary would be a different bug", err)
+				}
+			})
+		})
+	})
+}

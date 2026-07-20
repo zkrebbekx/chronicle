@@ -323,6 +323,20 @@ func (l *Log) write(ctx context.Context, kind, entityID string, data []byte, val
 	if actor.ID == "" {
 		return Result{}, ErrMissingActor
 	}
+	// NUL is rejected here for the same reason it is rejected in metadata
+	// below: a text column cannot hold it, so a write MemStore accepted would
+	// fail on pgstore with a driver error. One behaviour, everywhere.
+	for _, f := range [...]struct{ name, s string }{
+		{"kind", kind},
+		{"entity ID", entityID},
+		{"actor ID", actor.ID},
+		{"actor type", actor.Type},
+		{"actor name", actor.Name},
+	} {
+		if strings.ContainsRune(f.s, 0) {
+			return Result{}, fmt.Errorf("chronicle: %s contains a NUL byte: %w", f.name, ErrInvalidField)
+		}
+	}
 	valid = valid.UTC()
 	if err := valid.Validate(); err != nil {
 		return Result{}, &IntervalError{Field: "valid", Interval: valid, Err: ErrInvalidInterval}
@@ -331,6 +345,9 @@ func (l *Log) write(ctx context.Context, kind, entityID string, data []byte, val
 	var o writeOpts
 	for _, opt := range opts {
 		opt(&o)
+	}
+	if strings.ContainsRune(o.reason, 0) {
+		return Result{}, fmt.Errorf("chronicle: reason contains a NUL byte: %w", ErrInvalidField)
 	}
 	for k, v := range o.meta {
 		if strings.HasPrefix(k, MetaReservedPrefix) {

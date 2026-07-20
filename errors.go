@@ -44,6 +44,15 @@ var (
 	// reserves for itself rather than values no backend can store.
 	ErrInvalidMeta = errors.New("chronicle: invalid metadata")
 
+	// ErrInvalidField is returned by every write path for a caller-supplied
+	// string field no store can hold: a kind, entity ID, reason, actor field
+	// or hold field containing a NUL byte. PostgreSQL text columns cannot
+	// represent NUL, so accepting one would make the same write succeed on
+	// [MemStore] and fail on pgstore with a driver error — the write is
+	// rejected at the API boundary instead, identically everywhere. The
+	// metadata map has its own sentinel, [ErrInvalidMeta].
+	ErrInvalidField = errors.New("chronicle: invalid field")
+
 	// ErrZeroTxTime is returned by a store handed a zero transaction instant
 	// it would otherwise have stamped. A zero instant is not a timestamp:
 	// written as TxFrom it reads as "always believed" and as TxTo it reads as

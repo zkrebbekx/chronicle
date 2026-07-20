@@ -952,7 +952,44 @@ func runLog(t T, newStore Factory) {
 					if !errors.Is(err, chronicle.ErrInvalidMeta) {
 						t.Fatalf("Put = %v; want ErrInvalidMeta", err)
 					}
-					recs, _, qerr := s.Query(ctx, chronicle.Query{Kind: employee, EntityID: "e-nul"})
+					recs, _, qerr := s.Query(ctx, chronicle.Query{})
+					if qerr != nil {
+						t.Fatalf("Query failed: %v", qerr)
+					}
+					if len(recs) != 0 {
+						t.Fatalf("the rejected write left %d records behind; want none", len(recs))
+					}
+				})
+			}
+
+			// The same rule covers every caller-supplied text field, not just
+			// metadata: PostgreSQL text columns reject NUL exactly as jsonb
+			// does, so kind, entity ID, actor fields and reason are rejected
+			// at the boundary too.
+			for _, tc := range []struct {
+				name string
+				put  func() (chronicle.Result, error)
+			}{
+				{"a NUL byte in the kind", func() (chronicle.Result, error) {
+					return l.Put(ctx, "bad\x00kind", "e-nul", []byte(`{"a":1}`), feb, time.Time{}, alice)
+				}},
+				{"a NUL byte in the entity ID", func() (chronicle.Result, error) {
+					return l.Put(ctx, employee, "e\x00nul", []byte(`{"a":1}`), feb, time.Time{}, alice)
+				}},
+				{"a NUL byte in the actor ID", func() (chronicle.Result, error) {
+					return l.Put(ctx, employee, "e-nul", []byte(`{"a":1}`), feb, time.Time{}, chronicle.Actor{ID: "u\x001"})
+				}},
+				{"a NUL byte in the reason", func() (chronicle.Result, error) {
+					return l.Put(ctx, employee, "e-nul", []byte(`{"a":1}`), feb, time.Time{}, alice, chronicle.WithReason("why\x00not"))
+				}},
+			} {
+				t.Run("then "+tc.name+" is rejected identically for every store", func(t T) {
+					if _, err := tc.put(); !errors.Is(err, chronicle.ErrInvalidField) {
+						t.Fatalf("Put = %v; want ErrInvalidField", err)
+					}
+					// Unrestricted query: the rejected kind and entity ID
+					// differ per case, and nothing must land under any of them.
+					recs, _, qerr := s.Query(ctx, chronicle.Query{})
 					if qerr != nil {
 						t.Fatalf("Query failed: %v", qerr)
 					}

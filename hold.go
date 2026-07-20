@@ -2,6 +2,8 @@ package chronicle
 
 import (
 	"context"
+	"fmt"
+	"strings"
 	"time"
 )
 
@@ -102,6 +104,21 @@ func (h Hold) Validate() error {
 	}
 	if h.PlacedBy.ID == "" {
 		return &HoldError{ID: h.ID, Err: ErrMissingActor}
+	}
+	// Same boundary rule as Log writes: a NUL byte fits in memory but not in
+	// a PostgreSQL text column, so it is rejected here for every store alike.
+	for _, f := range [...]struct{ name, s string }{
+		{"hold ID", h.ID},
+		{"kind", h.Kind},
+		{"entity ID", h.EntityID},
+		{"reason", h.Reason},
+		{"actor ID", h.PlacedBy.ID},
+		{"actor type", h.PlacedBy.Type},
+		{"actor name", h.PlacedBy.Name},
+	} {
+		if strings.ContainsRune(f.s, 0) {
+			return &HoldError{ID: h.ID, Err: fmt.Errorf("%s contains a NUL byte: %w", f.name, ErrInvalidField)}
+		}
 	}
 	return nil
 }
