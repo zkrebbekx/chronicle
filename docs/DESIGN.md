@@ -131,12 +131,25 @@ the reason every incumbent is unusable outside its own framework.
 
 ```
 type Store interface {
-    Put(ctx context.Context, recs []Record) error
+    Apply(ctx context.Context, w Write) error   // atomic supersede + insert
     Get(ctx context.Context, q GetQuery) (*Record, error)
     Query(ctx context.Context, q Query) ([]Record, Cursor, error)
-    Supersede(ctx context.Context, ids []RecordID, txTo time.Time) error
 }
 ```
+
+**Correction, found during phase 1.** An earlier version of this design had
+separate `Put` and `Supersede` methods. That interface *cannot express the
+library's headline invariant*: a write that supersedes three records and
+inserts four must not be observable half-applied, and with two independent
+calls there is no shared transaction in which to make that true. A reader
+landing between them sees either a gap or an overlap in valid time.
+
+`Apply` takes the supersessions and the insertions together, so atomicity is
+expressible rather than hoped for. SQL implementations must run it in one
+transaction. Phase 1 shipped this as an optional `Atomic` extension to keep the
+original four methods; it should be promoted into `Store` proper before the
+Postgres adapter lands, because the non-atomic fallback path is a footgun that
+only looks correct in single-threaded tests.
 
 Postgres is the first adapter. It earns that by doing work chronicle would
 otherwise do badly itself:
@@ -144,8 +157,28 @@ otherwise do badly itself:
 - `tstzrange` for both axes, with GiST indexes
 - exclusion constraints (`btree_gist`) to make overlapping valid intervals for
   the same entity *structurally impossible* rather than merely checked in
-  application code
+  application code — but see the deferrability requirement below
 - partitioning on transaction time for the retention/archival story
+
+Three requirements the adapter must satisfy. All three were found in phase 1
+review, and all three are correctness issues rather than tuning choices:
+
+1. **The exclusion constraint must be `DEFERRABLE INITIALLY DEFERRED`.**
+   Constraints are checked per statement, and a single legitimate `Apply`
+   passes through an intermediate state where the superseded record is not yet
+   closed and its replacement is already inserted. A non-deferred constraint
+   rejects ordinary correct writes.
+2. **The read-modify-write needs real isolation.** chronicle scans the
+   overlapping records *before* computing the split. Two concurrent writers to
+   one entity can both observe the same pre-state and each split it, producing
+   two current records covering the same instant. The adapter must use
+   `SERIALIZABLE`, or `SELECT ... FOR UPDATE` over the entity's current
+   records. In-process mutexes do not survive a second process.
+3. **Transaction time should be assigned database-side** — a sequence, or
+   `clock_timestamp()` inside a serializable transaction — rather than by the
+   Go process. The in-memory implementation ratchets tx time forward per `Log`,
+   which is only sound with a single writer; two `Log` values over one store
+   each ratchet against their own history and can interleave.
 
 An in-memory store ships alongside for tests and for callers who want the
 semantics without a database.
@@ -217,7 +250,8 @@ From practitioner reports of hand-rolled systems:
 
 | Failure | chronicle's answer |
 |---|---|
-| WAL/CDC tailing loses actor + intent | `Actor` and `Reason` are first-class on the write path, not inferred |
+| WAL/CDC tailing loses actor identity | `Actor` is **required** on every write and has no defaulting path, so it cannot silently degrade to "system" |
+| WAL/CDC tailing loses business intent | Partly. `Intent` (assert / correct / remainder) is always recorded. `Reason` is free text and **optional** — see COMPLIANCE.md — so it captures intent only where callers supply it. A field you do not require cannot be relied upon; chronicle does not pretend otherwise |
 | Trigger shadow tables drift from schema | History is codec-serialized, not a mirrored column set |
 | Event streams can't reconstruct point-in-time | Full-row records with as-of on both axes |
 | Audit table outgrows the primary | Partitioned on tx-time, retention + archival built in |
@@ -228,12 +262,24 @@ From practitioner reports of hand-rolled systems:
 
 1. Codec — JSON first. `Data []byte` keeps it pluggable, but the *query by
    changed field* path needs structured access, so Postgres `jsonb` is the
-   likely concrete floor.
-2. Does `Correct` need to be storage-distinct from `Put`, or is an intent flag
-   enough? Leaning flag.
-3. Whether non-overlap should be enforced for transaction time too, or only
-   valid time. Valid time certainly; tx-time overlap should be impossible by
-   construction if only chronicle writes it.
-4. Diffing nested structures — enthistory does flat scalar fields only via
-   `reflect.DeepEqual` and explicitly does not solve nested. Structural diff is
-   a genuine differentiator but is its own hard problem.
+   likely concrete floor. **Still open**, and deferred out of phase 1 for that
+   reason: it cannot be done efficiently in a memory store.
+2. ~~Does `Correct` need to be storage-distinct from `Put`?~~ **Answered:** no.
+   An `Intent` flag on the record is sufficient and shipped.
+3. ~~Non-overlap on the transaction axis?~~ **Answered, with a precondition.**
+   Tx-time overlap is impossible by construction only when a *single* writer
+   assigns transaction time. That holds for one `Log`; it does not hold across
+   processes, which is why the SQL adapter must assign tx time database-side.
+4. ~~Structural diffing of nested records.~~ **Answered:** implemented in full
+   — nested objects and arrays to any depth, RFC 6901 paths with `~0`/`~1`
+   escaping, shape changes reported once at the node rather than as an
+   add/remove burst, and `json.Number` so large integers compare exactly.
+   Known limitation, documented and tested rather than papered over: **arrays
+   compare by position**, so inserting at the head reports every later element
+   as modified. An LCS or identity-field heuristic guesses at caller intent;
+   a stated rule is more honest.
+5. **New.** Remainder records carry the *superseded* record's actor, reason and
+   meta, not the splitting writer's — otherwise the log would claim someone
+   asserted data they never sent. Attribution is not lost: remainders share
+   `TxFrom` with the write that caused them, so the assert/correct record at
+   that instant identifies who split it.
