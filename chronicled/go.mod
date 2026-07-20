@@ -5,7 +5,7 @@ go 1.25.0
 require (
 	github.com/jackc/pgx/v5 v5.9.2
 	github.com/zkrebbekx/chronicle v0.1.0
-	github.com/zkrebbekx/chronicle/pgstore v0.1.1
+	github.com/zkrebbekx/chronicle/pgstore v0.1.2
 )
 
 require (
