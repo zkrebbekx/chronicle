@@ -97,6 +97,18 @@ chronicle.Between(march, june).Overlaps(chronicle.Since(june)) // false — adja
 
 Use `Interval`'s methods rather than comparing record timestamps yourself.
 
+Zero values are meaningful throughout, and they do not all mean the same
+thing — the two worth keeping apart are `As` (zero means *now*) and `Query`
+(zero means *no restriction*):
+
+| Type | Its zero value means |
+|---|---|
+| `Interval` | all of time (`Always()`) |
+| `As` | now, on both axes, resolved when the read is made |
+| `Query` | match everything: no filters, no limit, ascending |
+| `GetQuery` | a real point — the zero instants are year-1 coordinates, not wildcards; `Log.Get` resolves "now" before the store ever sees the query |
+| `Cursor` | passed in: start at the beginning; returned: no next page |
+
 ## Writes split intervals
 
 `Put` and `Correct` run the same algorithm and are identical in storage; they
@@ -111,6 +123,18 @@ log.Put(ctx, "employee", "alice", []byte(`{"grade":"L4"}`), april, june, hr)
 // [2026-04-01, 2026-06-01)  {"grade":"L4"}
 // [2026-06-01, ∞)           {"grade":"L3"}
 ```
+
+`PutInterval` and `CorrectInterval` are the same two operations taking an
+`Interval` value rather than a pair of instants — handy at call sites that
+already hold one.
+
+To record that a fact **stopped being true**, assert it with a bounded
+`ValidTo` — a `Put` of the same state over `[from, end)` closes the open-ended
+version and leaves the timeline uncovered after `end`, which is the honest
+shape for "we do not assert anything from then on". Where "ended" is itself a
+fact worth recording, write a successor state that says so in its data (a
+status field, or JSON `null`), so readers find an assertion rather than an
+absence.
 
 The uncovered parts of the superseded record are rewritten as **remainders**.
 A remainder carries the *superseded record's* actor, reason and metadata, and
@@ -147,7 +171,7 @@ The ratchet is per-`Log`, and a `Log`'s clock is only authoritative when it is
 the only writer. `Store.Apply` therefore *owns* the transaction axis: it picks
 the instant, stamps it on everything the write inserts and closes, and returns
 it, and the log adopts whatever comes back. `MemStore` accepts the log's
-proposal because a `MemStore` has exactly one process writing to it. `pgstore`
+proposal because a `MemStore` has exactly one `Log` writing to it. `pgstore`
 takes the instant from the database, so any number of processes and any number
 of `Log` values over one store still produce a single ordered history.
 
@@ -162,7 +186,8 @@ log.Query(ctx, q)                          // cross-entity, filtered, paginated
 ```
 
 `As{ValidAt, TxAt}` locates a point in bitemporal space; a zero field means
-"now". `chronicle.Now()`, `ValidAt(t)` and `AsOf(t)` cover the common cases.
+"now". `chronicle.Now()`, `ValidAt(t)`, `Believed(tx)` and `AsOf(t)` cover the
+common cases.
 
 Pagination is keyset, ordered by transaction start, then valid start, then the
 unique record ID. Because the ID is the final tiebreaker the order is total, so
@@ -203,8 +228,9 @@ decoded structures, reporting each change with an RFC 6901 JSON Pointer path.
 It descends into nested objects and arrays to any depth. A change of *shape* at
 a node — an object becoming a scalar — is reported once at that node rather
 than as a burst of unrelated additions and removals. Objects compare by key, so
-reordering keys is not a change. Numbers decode as `json.Number`, so integers
-beyond `float64`'s exact range compare correctly.
+reordering keys is not a change. Numbers compare **by value, exactly** — no
+`float64` round trip, so integers beyond its range compare correctly, and a
+change of notation (`1` to `1.0`, `100` to `1e2`) is not a change of value.
 
 **Documented limitation:** arrays are compared **by position**. Inserting an
 element at the head of an array reports every later element as modified plus
@@ -272,8 +298,15 @@ no single process's clock is authoritative — and the log adopts what comes bac
 
 `StaticWrite` wraps an already-decided `Write` as a `Planner`, for seeding and
 migrations. It opts out of the protection above, so a store may reject it with
-`ErrConflict`; the log retries such a conflict `DefaultWriteRetries` times, and
-`WithWriteRetries` tunes that.
+`ErrConflict` — and since the `Log` never issues a `StaticWrite`, retrying one
+is its caller's job. The `Log`'s own retry loop (`DefaultWriteRetries`
+attempts, tuned by `WithWriteRetries`) covers the conflicts its *planned*
+writes can still meet: something other than chronicle writing an overlapping
+record into the same table.
+
+Ordinary callers never build an `ApplyRequest` — the `Log` constructs one for
+every write; only store implementers and seeding or migration code touch the
+type directly.
 
 `MemStore` is the reference implementation and is safe for concurrent use.
 `pgstore` is the Postgres adapter — see below.
@@ -304,15 +337,20 @@ backdatable `EffectiveFrom`, store-assigned `PlacedAt`, releases that keep the
 row), and `chroniclefest.RunKeyring` holds a `Keyring` to stable per-subject
 keys and terminal destruction.
 
-The suite reports through `chroniclefest.T`, a narrow interface `*testing.T`
-already satisfies, so it can also be driven by a harness that records failures
-instead of aborting. That is how the suite itself is tested: `chroniclefest`'s
-own tests run it against two dozen stores each broken in exactly one nameable
-way — non-atomic apply, ignored supersession, a caller-chosen transaction time,
-uni-temporal `Get`, a keyset cursor that drops or repeats a row, a lossy round
-trip — and assert that the suite fails, and fails on the check that names the
-fault. A conformance suite whose failure branches have never executed is not
-evidence that it checks anything.
+The suite reports through `chroniclefest.T`, a narrow testing interface.
+`*testing.T` does not satisfy it directly — `Run` takes a `func(T)` rather
+than a `func(*testing.T)` — so `chroniclefest.Wrap` adapts one, and
+`chroniclefest.Run` does the wrapping for you; the interface exists so the
+suite can also be driven by a harness that records failures instead of
+aborting. That is how the suite itself is tested: `chroniclefest`'s own tests
+run it against forty-six implementations each broken in exactly one nameable
+way — thirty-six stores (non-atomic apply, ignored supersession, a
+caller-chosen transaction time, uni-temporal `Get`, a keyset cursor that drops
+or repeats a row, a lossy round trip) and ten compliance and keyring variants
+(deletes that take current belief with them, holds that vanish, keys that
+re-mint after destruction) — and assert that the suite fails, and fails on the
+check that names the fault. A conformance suite whose failure branches have
+never executed is not evidence that it checks anything.
 
 ## Postgres
 
@@ -375,24 +413,32 @@ decision from records, and its doc comment says so bluntly.
 - **Non-overlap is structural.** An `EXCLUDE USING gist (kind =, entity_id =,
   valid &&) WHERE (tx_to IS NULL)` constraint makes two current records covering
   the same valid instant for one entity impossible, rather than merely checked
-  in Go. It is `DEFERRABLE INITIALLY DEFERRED` because a correct `Apply` passes
-  through an intermediate state — replacement inserted, predecessor not yet
-  closed — that a per-statement check would reject.
+  in Go. It is `DEFERRABLE INITIALLY DEFERRED`, which keeps the constraint
+  correct under *any* statement order: the shipped `Apply` closes superseded
+  records before inserting their replacements and never passes through an
+  overlapping state itself, but the deferral costs nothing and does not depend
+  on that ordering staying true.
 - **Writes to one entity serialize.** `Apply` takes a `pg_advisory_xact_lock`
   per `(kind, entity_id)` *before* it reads anything, and holds it to commit.
   The overlapping records are then read `FOR UPDATE` inside the same
   transaction and handed to the plan, so a plan cannot go stale between the
-  read and the write. Readers are never blocked, and writes to different
-  entities do not contend.
+  read and the write. Readers are never blocked, and at the store level writes
+  to different entities do not contend. That last property does not survive
+  end-to-end through a single `Log`, though: a `Log` serializes its own writes,
+  whatever entity they name, so one `Log` has at most one write in flight
+  process-wide. Where cross-entity write throughput matters, run one `Log` per
+  worker over the same `pgstore` — safe, because the store, not any one log,
+  assigns transaction time.
 - **Stale plans are rejected, not applied.** A `StaticWrite` was not planned
   from that read, so `Apply` also re-checks that every record it means to
   supersede is still current, and the deferred exclusion constraint catches
   anything the check missed. Either way the result is `ErrConflict`.
 - **Transaction time comes from the database.** `Apply` stamps
-  `GREATEST(clock_timestamp(), <newest tx_from among the records being
-  closed> + 1µs)`, so a superseded record can never be left with an empty
-  transaction interval that no as-of query could see. `ApplyRequest.TxAt` from
-  the log is discarded.
+  `GREATEST(clock_timestamp(), <newest tx_from among the current records read
+  for the plan> + 1µs)` — a floor extended, before anything is closed, over
+  the supersede targets an unplanned write named itself — so a superseded
+  record can never be left with an empty transaction interval that no as-of
+  query could see. `ApplyRequest.TxAt` from the log is discarded.
 - **Microsecond resolution.** `timestamptz` stores microseconds, so a
   `time.Time` with nanosecond precision is truncated on the way in. chronicle's
   own transaction timestamps are assigned by the database and so are already
@@ -407,10 +453,12 @@ current shape there is nothing left for it to protect, because the read and the
 write are already in one transaction behind one lock. It would add mandatory
 `40001` retry handling and buy nothing either way.
 
-Index usage is asserted rather than assumed: `TestQueryPlans` runs `EXPLAIN` over
-a seeded table and fails on a sequential scan. Every query in the surface plans
-as an index scan, including the keyset predicate, which Postgres takes as an
-`Index Cond` rather than a filter — so resuming a page is a seek, not a scan.
+Index usage is asserted rather than assumed: `TestQueryPlans` runs `EXPLAIN`
+over a seeded table and fails if any of the six selective query shapes — entity
+lookups, actor scans, point-in-time gets, and keyset resumption among them —
+plans as a sequential scan. It asserts the absence of `Seq Scan`, not the
+presence of `Index Cond`, so it proves the planner never falls back to reading
+the table, which is the regression that matters at scale.
 
 ### Not done here
 

@@ -117,7 +117,7 @@ makes the log trustworthy at all.
 Get(ctx, kind, id, As{ValidAt, TxAt})    // one record, both axes
 History(ctx, kind, id, ...)              // all versions, either axis
 Diff(ctx, kind, id, from, to)            // field-level changes between two points
-Timeline(ctx, kind, id)                  // valid-time sequence at current belief
+Timeline(ctx, kind, id, as)              // valid-time sequence at one belief instant
 Query(ctx, ...)                          // cross-entity, filtered, paginated
 ```
 
@@ -161,7 +161,8 @@ record with its own proposed `TxFrom` and reports that instant in `Result.TxAt`;
 if the store silently substitutes its own, the log hands the caller a timestamp
 that is not in the database and resolves later reads of "now" against a clock
 that is behind the log's newest record. The instant has to come back out.
-`Write.TxAt` is consequently a *proposal*, and the store has the last word.
+`Write.TxAt` [now `ApplyRequest.TxAt`] is consequently a *proposal*, and the
+store has the last word.
 
 Postgres is the first adapter. It earns that by doing work chronicle would
 otherwise do badly itself:
@@ -489,3 +490,18 @@ From practitioner reports of hand-rolled systems:
    practice means records written together, so a within-log ordering suffices.
    Documented on `RecordID`; worth revisiting if IDs ever become a public sort
    key rather than an internal tiebreak.
+8. **New, post-phase-3 review. One `Log` holds its write lock across the store
+   call, so writes to different entities do not proceed concurrently through a
+   single `Log`.** The store level is fine — pgstore's advisory lock is
+   per-entity — but `Log.mu` is held from ratchet tick to `Apply` return,
+   which serializes the whole process's writes and makes "writes to different
+   entities do not contend" false end-to-end. The documented answer today is
+   one `Log` per worker over a store that assigns transaction time (safe by
+   construction; the ratchet then follows the store). The open question is
+   whether the lock can be narrowed instead — held only for the tick and the
+   ID mint, with `Apply` outside it. The hazards to resolve before trying:
+   the ratchet adoption after `Apply` (`lastTx` must never move backwards
+   while another write is mid-flight), the meaning of per-log sequence
+   numbers once writes interleave, and `MemStore`, whose adoption of the
+   log's proposal assumes the proposals arrive in order. Not attempted in the
+   review that found it; a doc-only correction shipped instead.

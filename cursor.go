@@ -53,6 +53,14 @@ type CursorKey struct {
 // A [Store] returns one when it withholds records, and only then: a cursor
 // that comes back empty is what lets callers terminate a paging loop without a
 // trailing empty page.
+//
+// Two edges of the encoding are worth knowing when seeding records with
+// caller-chosen IDs. The payload is delimited with the unit separator \x1f, so
+// an ID containing that byte encodes to a token [DecodeCursor] rejects;
+// chronicle-minted IDs never contain it, and seeded IDs must not. And the
+// timestamps travel as RFC 3339, which cannot represent a year of 10000 or
+// beyond — a concern only for a deliberately absurd fixture, but the failure
+// is a rejected cursor rather than a wrong page.
 func EncodeCursor(r Record) Cursor {
 	payload := strings.Join([]string{
 		cursorVersion,

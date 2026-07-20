@@ -19,8 +19,8 @@
 // the caller cannot set it, and it is never rewritten. There is no exported
 // field, option or argument anywhere in this package that writes TxFrom or
 // TxTo, and that absence is the whole basis for trusting the log — a
-// transaction axis its users can write records what someone wanted to have
-// believed rather than what was believed.
+// transaction axis that its users could write would record what someone
+// wanted to have believed rather than what was believed.
 //
 // The pair makes three genuinely different questions separable:
 //
@@ -86,8 +86,11 @@
 // number — pushes the tiebreak into every reader and every downstream query.
 // Ratcheting keeps it in one place. The cost is that transaction time can lead
 // the wall clock by a nanosecond per write under sustained load, which
-// self-corrects as soon as the write rate drops. The ratchet is per-Log; run
-// one Log per store.
+// self-corrects as soon as the write rate drops. The ratchet is per-Log, and
+// what that requires depends on the store: a [MemStore] adopts the log's
+// instants and so must have exactly one Log writing to it, while a store that
+// assigns transaction time itself — pgstore does — supports any number of
+// Logs over one store.
 //
 // Record IDs embed the transaction instant and a sequence number, so they sort
 // in write order and give queries a total order even across the records of a
@@ -151,12 +154,21 @@
 //
 // Apply also returns the transaction instant it assigned, which a store with
 // more than one writing process must take from somewhere central rather than
-// from any one process's clock. The log adopts whatever comes back.
+// from any one process's clock. The log adopts whatever comes back. A store's
+// valid-time resolution is its own — pgstore holds microseconds, so
+// caller-supplied valid times round-trip only to the microsecond there.
 //
-// [ErrConflict] reports a write planned against state that has since moved,
-// which a planned write cannot be but a [StaticWrite] can. The log re-reads,
-// re-splits and tries again, up to [DefaultWriteRetries] times — see
-// [WithWriteRetries].
+// A cancelled context means nothing lands: every store method honours
+// cancellation, and pgstore rolls the whole transaction back.
+//
+// [ErrConflict] reports a write planned against state that has since moved.
+// The [Log]'s own writes are planned inside the store's lock and cannot go
+// stale that way; the log's retry loop exists for the residue — something
+// other than chronicle writing an overlapping record into the same table —
+// and retries up to [DefaultWriteRetries] times (see [WithWriteRetries]). A
+// [StaticWrite] opts out of planning entirely, so a store may reject it with
+// ErrConflict too; the Log never issues one, and callers driving a store
+// directly retry for themselves.
 //
 // # Compliance
 //
@@ -187,30 +199,36 @@
 // # Errors
 //
 // Match errors with [errors.Is] against [ErrNotFound], [ErrInvalidInterval],
-// [ErrMissingActor], [ErrUnknownKind], [ErrCodec], [ErrInvalidCursor],
-// [ErrMissingEntityID], [ErrClosed], [ErrConflict], and the compliance
-// layer's [ErrMissingHoldID], [ErrHoldExists], [ErrHoldReleased],
-// [ErrCurrentRecord], [ErrNoChain], [ErrReservedMeta], [ErrShredded],
-// [ErrKeyDestroyed] and [ErrNoKeyring]. Where extra context helps, the
-// concrete error is also available via [errors.As]: [*IntervalError],
-// [*KindError], [*CodecError], [*NotFoundError], [*CursorError],
-// [*ConflictError], [*HoldError], [*DeleteError], [*ChainError], [*KeyError]
-// and [*ShredError].
+// [ErrMissingActor], [ErrUnknownKind], [ErrUnknownIntent], [ErrCodec],
+// [ErrInvalidCursor], [ErrMissingEntityID], [ErrClosed], [ErrConflict],
+// [ErrInvalidMeta], [ErrZeroTxTime], and the compliance layer's
+// [ErrMissingHoldID], [ErrHoldExists], [ErrHoldReleased], [ErrCurrentRecord],
+// [ErrNoChain], [ErrReservedMeta], [ErrShredded], [ErrKeyDestroyed] and
+// [ErrNoKeyring]. Where extra context helps, the concrete error is also
+// available via [errors.As]: [*IntervalError], [*KindError], [*IntentError],
+// [*CodecError], [*NotFoundError], [*CursorError], [*ConflictError],
+// [*HoldError], [*DeleteError], [*ChainError], [*KeyError] and
+// [*ShredError].
 //
 // # Concurrency
 //
-// A [Log] and a [MemStore] are safe for concurrent use. Records are deep-
-// copied crossing the store boundary in both directions, so a caller can
+// A [Log] and a [MemStore] are safe for concurrent use. Records are
+// deep-copied crossing the store boundary in both directions, so a caller can
 // neither reach into the log through data it wrote nor corrupt it by mutating
-// a record it read.
+// a record it read. Note that a single Log serializes its writes — see the
+// concurrency note on [Log] before sizing a deployment.
 //
 // # Scope
 //
-// This is the core temporal engine. It is not a database — Postgres does the
-// hard storage work — nor a CDC/WAL tailer, which loses the actor identity and
-// business intent a change record exists to capture, nor an event-sourcing
-// framework, since chronicle records what an entity was rather than a stream
-// of commands to fold.
+// This is the core temporal engine plus the compliance layer above: retention
+// (the retain subpackage), legal hold, opt-in tamper evidence and
+// crypto-shredding all ship. What does not ship is any service around the
+// library — no REST API and no management console; chronicle is a package you
+// embed. It is also not a database — Postgres does the hard storage work —
+// nor a CDC/WAL tailer, which loses the actor identity and business intent a
+// change record exists to capture, nor an event-sourcing framework, since
+// chronicle records what an entity was rather than a stream of commands to
+// fold.
 //
 // The Postgres adapter lives in the pgstore submodule and the retention
 // sweeper in the retain subpackage, keeping this package dependency-free and
