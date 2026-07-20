@@ -6,7 +6,7 @@ replace github.com/zkrebbekx/chronicle => ../
 
 require (
 	github.com/jackc/pgx/v5 v5.9.2
-	github.com/zkrebbekx/chronicle v0.0.0-00010101000000-000000000000
+	github.com/zkrebbekx/chronicle v0.1.0
 )
 
 require (
