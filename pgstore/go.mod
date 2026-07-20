@@ -1,11 +1,11 @@
 module github.com/zkrebbekx/chronicle/pgstore
 
-go 1.24.0
+go 1.25.0
 
 replace github.com/zkrebbekx/chronicle => ../
 
 require (
-	github.com/jackc/pgx/v5 v5.8.0
+	github.com/jackc/pgx/v5 v5.9.2
 	github.com/zkrebbekx/chronicle v0.0.0-00010101000000-000000000000
 )
 
