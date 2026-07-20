@@ -2,11 +2,12 @@
 
 Bitemporal entity change history for Go. ORM-agnostic, over `database/sql`.
 
-Status: phases 1–4 implemented — core model, in-memory store, Postgres
+Status: phases 1–5 implemented — core model, in-memory store, Postgres
 adapter, conformance suite, the compliance layer (retention, legal hold,
-tamper evidence, crypto-shredding), and `chronicled`, the standalone REST
-service. Corrections found while implementing are recorded inline, marked
-**Correction**, rather than silently edited away.
+tamper evidence, crypto-shredding), `chronicled`, the standalone REST
+service, and field history, the single-field audit trail. Corrections found
+while implementing are recorded inline, marked **Correction**, rather than
+silently edited away.
 
 ## Why this exists
 
@@ -119,6 +120,7 @@ Get(ctx, kind, id, As{ValidAt, TxAt})    // one record, both axes
 History(ctx, kind, id, ...)              // all versions, either axis
 Diff(ctx, kind, id, from, to)            // field-level changes between two points
 Timeline(ctx, kind, id, as)              // valid-time sequence at one belief instant
+FieldHistory(ctx, kind, id, path, as)    // one field's changes over transaction time (phase 5)
 Query(ctx, ...)                          // cross-entity, filtered, paginated
 ```
 
@@ -523,6 +525,78 @@ the static-binary claim end to end, with a compose file for the
 one-command demo. The OpenAPI document is hand-written, embedded via
 `go:embed`, served authenticated, and a test fails if any routed path is
 missing from it.
+
+## Phase 5: field history
+
+`FieldHistory(ctx, kind, id, path, as, opts...)` is the single-field audit
+trail — "how did our recorded belief about entity E's field X change over time,
+and who changed it". It is the read the *Reads* table above promised and had
+not delivered, and it is what Salesforce sells as Field Audit Trail.
+
+**It is built as a read-side composition, and that is the whole design.** It
+walks the entity's records that cover a fixed valid point — a single
+`Store.Query` with the `ValidAt` filter, paged internally — decodes each through
+the log's `Codec`, and reports each transaction step at which the value at
+`path` differs from the step before, by the *same* comparison `Diff` uses. It
+adds no `Store` method, no column, no migration, and touches nothing on the
+write path. Because it composes from capabilities both stores already have, it
+works identically on `MemStore` and pgstore and the conformance suite exercises
+it on both with no new store surface. The one new sentinel, `ErrInvalidPath`
+(with `*PathError`), distinguishes a malformed pointer from a well-formed one
+that matches nothing; the RFC 6901 machinery lives in one file, `pointer.go`,
+shared with the path grammar `Diff` already emits.
+
+The bitemporal framing the brief insisted on is the correct one, and the
+implementation holds it exactly: `as.ValidAt` pins the point in the world and
+the walk runs along the *transaction* axis, not valid time. `as.TxAt` is
+ignored — the mirror image of `Timeline`, which uses only `TxAt` — and that is
+documented rather than left as a surprise.
+
+**Correction, found during phase 5: the brief's present→absent mechanism does
+not exist.** The brief said a field goes absent when "a later belief bounds
+validTo before ValidAt". It does not. An ordinary `Put`/`Correct` never reduces
+an entity's valid coverage: a write whose interval stops before the queried
+point still leaves the superseded record's tail as a *remainder* carrying the
+old value across the point, so the point stays covered — by the old belief, not
+by absence. Total valid coverage after any write is the union of the old
+coverage and the new interval; it only ever grows. The present→absent
+transition is real but arrives another way: a later belief that still covers the
+point but whose object no longer *contains* the field — a correction that omits
+it, or a `null`-body tombstone (JSON `null` decodes to an empty object). That
+belief is a genuine record with an author and an instant, so the transition is
+attributed cleanly. Genuine coverage *lapse* — `Get` returning nothing at a
+point that was covered — is unreachable through the public write API; only
+destruction (retention) or erasure (shredding) can remove a belief, and
+`FieldHistory` reflects surviving history rather than resurrecting what was
+destroyed. The test that would have "proved" the brief's version passes for the
+wrong reason; the shipped test pins the actual behaviour.
+
+**Correction, found during phase 5: the name `FieldChange` was already taken.**
+The brief named the result element `FieldChange`, but that identifier is the
+element of a `Delta` — a *spatial* diff between two states, carrying an
+add/remove/modify `Op`. A field's history is a different shape: no `Op` (every
+element is a change by construction), an explicit presence flag on each side so
+absent stays distinct from null, and the attribution and both time coordinates
+of the introducing belief. Overloading one name with two meanings would have
+been the more confusing choice, so the element is `FieldRevision` and its value
+type is `FieldValue{Value, Present}`. The `absent`-vs-`null` distinction the
+brief flagged as the classic subtle bug is carried by that `Present` bool, and
+tested both directions (set→null is a change; null→dropped is a further change).
+
+Cost is linear in the number of beliefs ever recorded about the fixed valid
+point — one decode each — and independent of the rest of the log; the internal
+query is paged so a deep transaction history is never held in memory at once. A
+codec failure at any step is `ErrCodec` and a shredded belief is `*ShredError`,
+never a silently skipped step — the same posture `Diff` takes, for the same
+reason: a change log that under-reports is worse than one that fails.
+
+The service exposes it at `GET /v1/{kind}/{entity}/field-history?path=&validAt=&
+descending=`: `path` required (a 400 that explains, URL-decoded, NUL-rejected
+like every other read path), `validAt` optional and defaulting to now with the
+zero-rendering sentinel rejected, each change rendering `from`/`to` as raw JSON
+with a `present` flag so absent is an omitted value rather than a JSON null.
+It is a read, so `writer` or `admin` may call it, and `ErrInvalidPath` maps to
+400 `invalid_path` in the existing taxonomy.
 
 ## Failure modes this design answers
 

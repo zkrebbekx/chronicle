@@ -182,6 +182,7 @@ log.Get(ctx, kind, id, as)                 // one record, both axes
 log.History(ctx, kind, id, opts...)        // every version ever, superseded included
 log.Timeline(ctx, kind, id, as)            // valid-time sequence at one belief instant
 log.Diff(ctx, kind, id, from, to)          // field-level changes between two points
+log.FieldHistory(ctx, kind, id, path, as)  // one field's changes over transaction time
 log.Query(ctx, q)                          // cross-entity, filtered, paginated
 ```
 
@@ -242,6 +243,42 @@ would be worse than a rule that is simple and stated.
 A codec failure is `ErrCodec`, never an empty diff. A change log that reports
 "nothing changed" when it means "I could not tell" is worse than one that
 fails.
+
+## Field history
+
+`FieldHistory` is the single-field audit trail — the read this whole design
+promised, in its most focused form. Fix a point in *valid* time and it walks how
+the recorded value of one field changed over *transaction* time: who changed it,
+when we learned it, and whether it was an assertion or a correction.
+
+```go
+revs, _ := log.FieldHistory(ctx, "employee", "alice", "/salary", chronicle.ValidAt(march))
+// revs[0]: absent -> 50000   txAt=T1  intent=assert      actor=alice
+// revs[1]: 50000  -> 55000   txAt=T2  intent=correction  actor=bob   ← when we found we were wrong
+```
+
+It is a walk along the transaction axis at a fixed valid point, **not** along
+valid time — the part uni-temporal systems cannot express at all. The `path` is
+an RFC 6901 JSON Pointer in the exact grammar `Diff` emits, and equality is
+`Diff`'s, so a value re-recorded in different notation (`100` then `100.0`) is
+not a change and a field that never appears is an empty result, not an error. A
+malformed pointer is `ErrInvalidPath`; an undecodable record is `ErrCodec`,
+never a silent gap.
+
+Each side of a change carries a `present` flag, so a field **absent** from the
+object stays distinct from one explicitly set to JSON **null** — the classic
+subtle bug in a field-level trail, and two genuinely different facts here.
+
+It is a read-side composition over `Query` and the diff comparison: it adds no
+`Store` method and no schema, so it works identically on `MemStore` and Postgres
+and is exercised on both by the conformance suite. Cost is linear in the number
+of beliefs ever recorded about the fixed valid point — one query, paged
+internally, one decode each — and independent of the rest of the log. A
+present→absent change comes from a later belief that still covers the point but
+drops the field (a correction that omits it, or a `null`-body tombstone); an
+ordinary `Put`/`Correct` cannot instead make the *coverage* lapse, because the
+superseded record's tail is preserved as a remainder carrying the old value
+across the point.
 
 ## Storage
 
@@ -674,12 +711,23 @@ curl -s "localhost:8080/v1/employee/alice?validAt=2026-03-15T00:00:00Z" -H "$AUT
 
 # What did we believe about March at $T1?     → 50000, unrewritten
 curl -s "localhost:8080/v1/employee/alice?validAt=2026-03-15T00:00:00Z&txAt=$T1" -H "$AUTH"
+
+# How did our belief about the March salary evolve, and who changed it?
+#   → two changes: absent→50000 (assert), 50000→55000 (correction)
+curl -s "localhost:8080/v1/employee/alice/field-history?path=%2Fsalary&validAt=2026-03-15T00:00:00Z" -H "$AUTH"
 ```
 
-The full surface — history, timeline, diff, cross-entity query with opaque
-cursors, legal holds, retention sweeps with dry run, chain verification,
-key destruction — is documented in the embedded spec at `/v1/openapi.yaml`
-(authenticated) and mirrors the library exactly.
+The full surface — history, timeline, diff, single-field history, cross-entity
+query with opaque cursors, legal holds, retention sweeps with dry run, chain
+verification, key destruction — is documented in the embedded spec at
+`/v1/openapi.yaml` (authenticated) and mirrors the library exactly.
+
+`GET /v1/{kind}/{entity}/field-history?path=&validAt=&descending=` is the
+single-field audit trail: for the entity's state valid at a fixed point, it
+walks how the value at one RFC 6901 JSON Pointer changed over transaction time —
+who changed it, when we learned it, and whether it was an assertion or a
+correction. It composes over the query surface and the diff comparison, so it
+adds no store method and behaves identically on every store.
 
 **Actor attribution is the service's one load-bearing decision.** Each
 configured token maps to an actor, and the service stamps that actor on every
