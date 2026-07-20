@@ -43,6 +43,11 @@ and it needs a second axis.
 import "github.com/zkrebbekx/chronicle"
 ```
 
+**[Try the playground →](https://zkrebbekx.github.io/chronicle/)** — a zero-backend,
+in-browser demo that makes the two time axes clickable. Load the *retroactive
+salary correction* story and watch the old belief and the correction coexist as
+two boxes on the valid-time × transaction-time grid.
+
 > **Status: phase 3.** The core model, the in-memory store, the Postgres
 > adapter and the compliance layer — retention, legal hold, optional tamper
 > evidence, crypto-shredding — are in. The REST service is a later phase. See
