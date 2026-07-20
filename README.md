@@ -641,6 +641,74 @@ shredding has to withstand your own infrastructure. Subject identifiers are
 stored in clear and survive shredding; make them pseudonymous references, not
 the personal data they protect.
 
+## Running the service
+
+Everything above is a library you embed. For polyglot shops that cannot
+import a Go package, the `chronicled/` module wraps the same engine in a
+standalone REST service — same semantics, same error taxonomy, JSON over
+HTTP. Its dependency list is part of the story: stdlib `net/http` (Go 1.22
+pattern routing), chronicle, pgstore, and `jackc/pgx/v5` as the database
+driver. No framework, no config library, no logging library.
+
+```sh
+cd chronicled && docker compose up --build
+```
+
+That starts Postgres and chronicled (migrated, chaining on) with two demo
+tokens. Then the flagship bitemporal scenario, over the wire:
+
+```sh
+AUTH='Authorization: Bearer demo-writer-token'
+
+# Assert: salary effective 1 March.
+curl -s -X POST localhost:8080/v1/employee/alice/records -H "$AUTH" \
+  -d '{"data":{"salary":50000},"validFrom":"2026-03-01T00:00:00Z"}'
+# → note "txAt" in the response; call it $T1
+
+# Correct, retroactively: it was actually 55000.
+curl -s -X POST localhost:8080/v1/employee/alice/corrections -H "$AUTH" \
+  -d '{"data":{"salary":55000},"validFrom":"2026-03-01T00:00:00Z"}'
+
+# What do we now believe March was?           → 55000
+curl -s "localhost:8080/v1/employee/alice?validAt=2026-03-15T00:00:00Z" -H "$AUTH"
+
+# What did we believe about March at $T1?     → 50000, unrewritten
+curl -s "localhost:8080/v1/employee/alice?validAt=2026-03-15T00:00:00Z&txAt=$T1" -H "$AUTH"
+```
+
+The full surface — history, timeline, diff, cross-entity query with opaque
+cursors, legal holds, retention sweeps with dry run, chain verification,
+key destruction — is documented in the embedded spec at `/v1/openapi.yaml`
+(authenticated) and mirrors the library exactly.
+
+**Actor attribution is the service's one load-bearing decision.** Each
+configured token maps to an actor, and the service stamps that actor on every
+write. No request body carries an actor — sending one is a 400 with an
+explanation, not a silent ignore — because an audit service that accepted
+caller-supplied actor claims would record fiction. Transaction time is
+likewise never accepted over the wire. Two roles exist: `writer` (write +
+read) and `admin` (also holds, retention, shredding, verification).
+
+**Honest scope:** this is API-key authentication for a single trust zone —
+anyone holding a token *is* that actor. Put mTLS or an OIDC-aware proxy in
+front for anything bigger; chronicled deliberately does not grow an identity
+provider. Configuration is environment-only (`CHRONICLED_DSN`,
+`CHRONICLED_ADDR`, `CHRONICLED_TOKENS` or `CHRONICLED_TOKENS_FILE`,
+`CHRONICLED_CHAINING`, `CHRONICLED_MIGRATE`, timeouts) and the service fails
+fast, with an actionable message, on anything malformed. Migration is opt-in
+and off by default — production schema changes should be explicit. Horizontal
+replicas are safe because pgstore assigns transaction time from the database
+clock; within one replica writes serialize through the process's single
+`Log` (see the phase 4 notes in [docs/DESIGN.md](docs/DESIGN.md)). Errors are
+always JSON — `{"error", "code", "detail?"}` with codes mirroring the
+library's sentinels (`not_found`, `invalid_interval`, `conflict`,
+`shredded`, `hold_released`, `no_policy`, …). Timestamps are RFC 3339 UTC,
+microsecond-precise end to end, inherited from Postgres `timestamptz`.
+
+The Dockerfile is multi-stage, `CGO_ENABLED=0`, to a
+`distroless/static-debian12:nonroot` final image — the whole runtime is the
+one static binary.
+
 ## Compliance, honestly
 
 See [docs/COMPLIANCE.md](docs/COMPLIANCE.md), which is sourced to primary

@@ -2,10 +2,11 @@
 
 Bitemporal entity change history for Go. ORM-agnostic, over `database/sql`.
 
-Status: phases 1–3 implemented — core model, in-memory store, Postgres
-adapter, conformance suite, and the compliance layer: retention, legal hold,
-tamper evidence, crypto-shredding. Corrections found while implementing are
-recorded inline, marked **Correction**, rather than silently edited away.
+Status: phases 1–4 implemented — core model, in-memory store, Postgres
+adapter, conformance suite, the compliance layer (retention, legal hold,
+tamper evidence, crypto-shredding), and `chronicled`, the standalone REST
+service. Corrections found while implementing are recorded inline, marked
+**Correction**, rather than silently edited away.
 
 ## Why this exists
 
@@ -416,6 +417,100 @@ permitted the wider request; worth knowing when reasoning about the cost of a
 chained write to an entity with many disjoint current intervals. The tail
 read happens inside the store's lock, in the planner, which is what makes the
 chain race-free across processes without any chain-specific locking.
+
+## Phase 4: chronicled, the standalone service
+
+The flexitype-pattern deployment: for polyglot shops that cannot import the
+Go library, `chronicled/` is a nested module wrapping one `chronicle.Log`
+over pgstore in a JSON REST API. The dependency budget is deliberate and
+part of the claim — stdlib `net/http` with Go 1.22 pattern routing, the two
+sibling modules, and `jackc/pgx/v5` as the driver. Nothing else: no router,
+no config library, no logging library (`log/slog` is stdlib).
+
+**The load-bearing decision is actor attribution.** An audit service that
+accepts caller-supplied actor claims records fiction, so each static bearer
+token maps in configuration to the `Actor` it writes as, and the service
+stamps that actor on every write — record writes, hold placement
+(`PlacedBy`) and hold release (`ReleasedBy`) alike. No request body carries
+an actor; its presence is a 400 explaining why, not a silent ignore, and the
+same rejection covers every transaction-time field. Token comparison is
+constant-time (`crypto/subtle` over SHA-256 digests, no early exit). Two
+roles: `writer` (write + read) and `admin` (also holds, retention sweeps,
+shredding, chain verification). This is API-key auth for a single trust
+zone, stated as such; anything bigger puts mTLS or OIDC in front, and the
+service does not grow an identity provider.
+
+Semantics the HTTP boundary must not erode, and how they are held: the
+server assigns transaction time (no `txAt` accepted anywhere); an absent
+`validTo` — or an explicit `null` — is the unbounded end; point lookups
+default absent instants to *now* while the cross-entity query treats absent
+filters as *no restriction*, preserving the library's deliberate `As`/`Query`
+contrast; the pagination cursor passes through opaquely, tested by walking
+the same store over HTTP and through the library and requiring identical
+sequences; every error is `{error, code, detail?}` with codes mirroring the
+sentinel taxonomy, mapped with `errors.Is`, and unmapped errors are a
+generic 500 so no driver string leaks.
+
+**Correction, found during phase 4: "one Log per process is safe because the
+store assigns transaction time" is true, and proves more than it was used
+for.** The phase brief pointed at horizontal scaling as the thing to worry
+about — per-replica Logs over one database. That is the *safe* direction:
+pgstore stamps every write from the database clock inside the write's own
+transaction, no process's ratchet is authoritative, and any number of Logs
+across any number of replicas produce one correctly ordered transaction
+axis. The wrinkle is *within* a replica: a `Log` serializes its writes
+(open question 8 above — `Log.mu` is held across the store call), so one
+replica lands one HTTP write at a time whatever entity it names, while
+pgstore's per-entity advisory lock would happily run disjoint entities
+concurrently. And the very argument that makes replicas safe — the store
+owns the transaction axis — equally licenses N Logs inside one process, so
+the ceiling is self-imposed, not structural. chronicled ships one Log per
+process anyway: an audit log's write path is rarely the bottleneck, chaining
+is simplest to reason about with one writer per process, and a Log pool is a
+mechanical change if a deployment ever measures the ceiling. The point of
+this correction is that the spec's safety argument and its deployment advice
+were the same sentence, and they are actually two claims with different
+strengths — safety is proven, single-Log is merely chosen.
+
+**Correction, found during phase 4: requiring `validFrom` over HTTP makes
+one corner of the library's model unreachable, and the asymmetry with
+`validTo` should be stated rather than discovered.** The wire contract
+requires `validFrom` while treating an absent or null `validTo` as
+unbounded. The library itself accepts a zero `ValidFrom` — "this fact was
+always true" — which the service therefore cannot express. The tightening is
+deliberate: in a JSON body an absent `validFrom` is overwhelmingly a
+forgotten field, not an assertion about all of history, and JSON decoding
+cannot distinguish absent from null to give the two different meanings. But
+it is an expressiveness loss, the openapi description says so, and if a
+deployment ever needs since-forever assertions over HTTP the right shape is
+an explicit sentinel (an `"unbounded": true` companion field, or accepting
+the literal string), never a defaulting absent field.
+
+Two smaller notes, recorded rather than papered over. First, the retention
+sweep endpoint computes `now` from the service clock while hold releases and
+supersessions are stamped by the database clock; retain's documented skew
+caveat therefore applies at the HTTP boundary, and the integration suite
+actually tripped over it (a just-released hold still withholding for the
+milliseconds the database clock ran ahead). Retention periods dwarf the skew
+in production; tests sleep past it. Second, the fixed endpoints
+(`/v1/records`, `/v1/holds`, `/v1/retention/…`, `/v1/subjects/…`) and the
+entity tree (`/v1/{kind}/{entity}/…`) are kept disjoint by segment count and
+literal precedence in the mux — no request is ambiguous — but an entity kind
+literally named `records` or `holds` will read oddly in URLs. The service
+does not reserve those kinds; the spec documents the namespace instead.
+
+Operationally: environment-only config failing fast with actionable
+messages; `Migrate` on boot strictly opt-in (schema changes in production
+should be explicit acts, and pgstore's `SchemaSQL`/`KeysSchemaSQL` exist for
+migration tools); graceful drain on SIGTERM/SIGINT before the DB closes;
+one structured log line per request with method, path, status, duration and
+actor ID — never the token, and never a request body, because bodies are
+the regulated data itself. The Docker image is a multi-stage
+`CGO_ENABLED=0` build into `distroless/static-debian12:nonroot`, proving
+the static-binary claim end to end, with a compose file for the
+one-command demo. The OpenAPI document is hand-written, embedded via
+`go:embed`, served authenticated, and a test fails if any routed path is
+missing from it.
 
 ## Failure modes this design answers
 
