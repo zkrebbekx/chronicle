@@ -278,7 +278,7 @@ ties, page boundaries, supersession idempotence, the non-overlap invariant:
 
 ```go
 func TestMyStore(t *testing.T) {
-    chroniclefest.Run(t, func(t *testing.T) chronicle.Store {
+    chroniclefest.Run(t, func(t chroniclefest.T) chronicle.Store {
         return mystore.New(...)
     })
 }
@@ -287,6 +287,16 @@ func TestMyStore(t *testing.T) {
 It runs against `MemStore` and `pgstore` on every build, which is what keeps the
 two answering identically rather than merely plausibly. It needs no driver, so
 it lives in the dependency-free root module.
+
+The suite reports through `chroniclefest.T`, a narrow interface `*testing.T`
+already satisfies, so it can also be driven by a harness that records failures
+instead of aborting. That is how the suite itself is tested: `chroniclefest`'s
+own tests run it against two dozen stores each broken in exactly one nameable
+way — non-atomic apply, ignored supersession, a caller-chosen transaction time,
+uni-temporal `Get`, a keyset cursor that drops or repeats a row, a lossy round
+trip — and assert that the suite fails, and fails on the check that names the
+fault. A conformance suite whose failure branches have never executed is not
+evidence that it checks anything.
 
 ## Postgres
 

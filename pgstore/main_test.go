@@ -44,6 +44,16 @@ const DSNEnv = "CHRONICLE_TEST_DSN"
 // and separate `go test` invocations against one database, cannot collide.
 var schemaSeq atomic.Uint64
 
+// fixtureT is the reporting surface the fixture helpers need. It is an
+// interface rather than *testing.T because the conformance suite hands its
+// factory a [chroniclefest.T], and both satisfy this.
+type fixtureT interface {
+	Helper()
+	Cleanup(func())
+	Errorf(format string, args ...any)
+	Fatalf(format string, args ...any)
+}
+
 // testDB opens the shared connection pool, or skips the test if no DSN is
 // configured.
 func testDB(t *testing.T) *sql.DB {
@@ -72,7 +82,7 @@ func testDB(t *testing.T) *sql.DB {
 // A schema per store rather than a table prefix, because dropping a schema
 // takes the table, its indexes and its constraints with it in one statement,
 // and because it makes a leaked fixture obvious rather than merely untidy.
-func newStore(t *testing.T, db *sql.DB) *pgstore.Store {
+func newStore(t fixtureT, db *sql.DB) *pgstore.Store {
 	t.Helper()
 	store, _ := newStoreNamed(t, db)
 	return store
@@ -80,7 +90,7 @@ func newStore(t *testing.T, db *sql.DB) *pgstore.Store {
 
 // newStoreNamed is [newStore] plus the schema it landed in, for tests that need
 // to open a second store over the same table through a different pool.
-func newStoreNamed(t *testing.T, db *sql.DB) (*pgstore.Store, string) {
+func newStoreNamed(t fixtureT, db *sql.DB) (*pgstore.Store, string) {
 	t.Helper()
 	schema := fmt.Sprintf("chronicle_test_%d_%d", os.Getpid(), schemaSeq.Add(1))
 
@@ -107,7 +117,7 @@ func newStoreNamed(t *testing.T, db *sql.DB) (*pgstore.Store, string) {
 // attach opens another store over an existing schema's table, through a
 // different connection pool. It does not migrate: the table is already there,
 // and the point is to have two genuinely independent handles on it.
-func attach(t *testing.T, db *sql.DB, schema string) *pgstore.Store {
+func attach(t fixtureT, db *sql.DB, schema string) *pgstore.Store {
 	t.Helper()
 	store, err := pgstore.New(db, pgstore.WithSchema(schema))
 	if err != nil {

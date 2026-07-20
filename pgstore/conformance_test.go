@@ -14,7 +14,7 @@ import (
 // treatment of half-open bounds.
 func TestConformance(t *testing.T) {
 	db := testDB(t)
-	chroniclefest.Run(t, func(t *testing.T) chronicle.Store {
+	chroniclefest.Run(t, func(t chroniclefest.T) chronicle.Store {
 		return newStore(t, db)
 	})
 }
