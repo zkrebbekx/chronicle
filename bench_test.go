@@ -251,8 +251,8 @@ func BenchmarkCursorRoundTrip(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		benchCursor = encodeCursor(rec)
-		if _, err := decodeCursor(benchCursor); err != nil {
+		benchCursor = EncodeCursor(rec)
+		if _, err := DecodeCursor(benchCursor); err != nil {
 			b.Fatal(err)
 		}
 	}

@@ -134,7 +134,7 @@ func runStore(t *testing.T, newStore Factory) {
 
 		t.Run("when an empty write is applied", func(t *testing.T) {
 			t.Run("then it succeeds and changes nothing", func(t *testing.T) {
-				if _, err := s.Apply(ctx, chronicle.Write{TxAt: feb}); err != nil {
+				if _, err := s.Apply(ctx, chronicle.ApplyRequest{TxAt: feb, Plan: chronicle.StaticWrite(chronicle.Write{})}); err != nil {
 					t.Fatalf("Apply of an empty write = %v; want nil", err)
 				}
 				recs, _, err := s.Query(ctx, chronicle.Query{})
@@ -163,7 +163,7 @@ func runStore(t *testing.T, newStore Factory) {
 			Intent:    chronicle.IntentCorrection,
 			Meta:      map[string]string{"ticket": "HR-1", "source": "workday"},
 		}
-		tx := apply(t, s, chronicle.Write{TxAt: jan, Insert: []chronicle.Record{want}})
+		tx := apply(t, s, chronicle.ApplyRequest{TxAt: jan, Plan: chronicle.StaticWrite(chronicle.Write{Insert: []chronicle.Record{want}})})
 		want.TxFrom = tx
 
 		t.Run("when it is read back", func(t *testing.T) {
@@ -241,9 +241,9 @@ func runStore(t *testing.T, newStore Factory) {
 
 	t.Run("given a record with unbounded valid ends", func(t *testing.T) {
 		s := newStore(t)
-		tx := apply(t, s, chronicle.Write{TxAt: jan, Insert: []chronicle.Record{{
+		tx := apply(t, s, chronicle.ApplyRequest{TxAt: jan, Plan: chronicle.StaticWrite(chronicle.Write{Insert: []chronicle.Record{{
 			ID: "r-open", Kind: employee, EntityID: "e1", Data: []byte("v"), Actor: alice,
-		}}})
+		}}})})
 
 		t.Run("when it is read back", func(t *testing.T) {
 			got := mustGet(t, s, chronicle.GetQuery{Kind: employee, EntityID: "e1", ValidAt: mar, TxAt: tx})
@@ -275,15 +275,13 @@ func runStore(t *testing.T, newStore Factory) {
 			ID: "r1", Kind: employee, EntityID: "e1", Data: []byte("v1"),
 			ValidFrom: feb, ValidTo: apr, Actor: alice,
 		}
-		tx1 := apply(t, s, chronicle.Write{TxAt: jan, Insert: []chronicle.Record{first}})
-		tx2 := apply(t, s, chronicle.Write{
+		tx1 := apply(t, s, chronicle.ApplyRequest{TxAt: jan, Plan: chronicle.StaticWrite(chronicle.Write{Insert: []chronicle.Record{first}})})
+		tx2 := apply(t, s, chronicle.ApplyRequest{TxAt: tx1.Add(time.Second), Plan: chronicle.StaticWrite(chronicle.Write{
 			Supersede: []chronicle.RecordID{"r1"},
-			TxAt:      tx1.Add(time.Second),
 			Insert: []chronicle.Record{{
 				ID: "r2", Kind: employee, EntityID: "e1", Data: []byte("v2"),
 				ValidFrom: feb, ValidTo: apr, Actor: bob, Intent: chronicle.IntentCorrection,
-			}},
-		})
+			}}})})
 
 		t.Run("when the transaction axis is walked", func(t *testing.T) {
 			t.Run("then the two instants are distinct and ordered", func(t *testing.T) {
@@ -329,16 +327,15 @@ func runStore(t *testing.T, newStore Factory) {
 
 	t.Run("given a supersession with nothing to insert", func(t *testing.T) {
 		s := newStore(t)
-		tx1 := apply(t, s, chronicle.Write{TxAt: jan, Insert: []chronicle.Record{{
+		tx1 := apply(t, s, chronicle.ApplyRequest{TxAt: jan, Plan: chronicle.StaticWrite(chronicle.Write{Insert: []chronicle.Record{{
 			ID: "r1", Kind: employee, EntityID: "e1", Data: []byte("v"), ValidFrom: feb, Actor: alice,
-		}}})
-		closed := apply(t, s, chronicle.Write{Supersede: []chronicle.RecordID{"r1"}, TxAt: tx1.Add(time.Second)})
+		}}})})
+		closed := apply(t, s, chronicle.ApplyRequest{TxAt: tx1.Add(time.Second), Plan: chronicle.StaticWrite(chronicle.Write{Supersede: []chronicle.RecordID{"r1"}})})
 
 		t.Run("when it is repeated", func(t *testing.T) {
 			t.Run("then it is idempotent", func(t *testing.T) {
-				if _, err := s.Apply(context.Background(), chronicle.Write{
-					Supersede: []chronicle.RecordID{"r1"}, TxAt: closed.Add(time.Hour),
-				}); err != nil {
+				if _, err := s.Apply(context.Background(), chronicle.ApplyRequest{TxAt: closed.Add(time.Hour), Plan: chronicle.StaticWrite(chronicle.Write{
+					Supersede: []chronicle.RecordID{"r1"}})}); err != nil {
 					t.Fatalf("repeated supersession = %v; want nil", err)
 				}
 				if got := byID(t, s, "r1").TxTo; !got.Equal(closed) {
@@ -350,9 +347,8 @@ func runStore(t *testing.T, newStore Factory) {
 
 		t.Run("when it names a record that does not exist", func(t *testing.T) {
 			t.Run("then it is not an error", func(t *testing.T) {
-				if _, err := s.Apply(context.Background(), chronicle.Write{
-					Supersede: []chronicle.RecordID{"no-such-record"}, TxAt: closed.Add(time.Hour),
-				}); err != nil {
+				if _, err := s.Apply(context.Background(), chronicle.ApplyRequest{TxAt: closed.Add(time.Hour), Plan: chronicle.StaticWrite(chronicle.Write{
+					Supersede: []chronicle.RecordID{"no-such-record"}})}); err != nil {
 					t.Fatalf("supersession of an unknown ID = %v; want nil", err)
 				}
 			})
@@ -361,25 +357,21 @@ func runStore(t *testing.T, newStore Factory) {
 
 	t.Run("given a split planned against a record someone else already closed", func(t *testing.T) {
 		s := newStore(t)
-		tx1 := apply(t, s, chronicle.Write{TxAt: jan, Insert: []chronicle.Record{{
+		tx1 := apply(t, s, chronicle.ApplyRequest{TxAt: jan, Plan: chronicle.StaticWrite(chronicle.Write{Insert: []chronicle.Record{{
 			ID: "r1", Kind: employee, EntityID: "e1", Data: []byte("v1"), ValidFrom: feb, ValidTo: apr, Actor: alice,
-		}}})
-		apply(t, s, chronicle.Write{
+		}}})})
+		apply(t, s, chronicle.ApplyRequest{TxAt: tx1.Add(time.Second), Plan: chronicle.StaticWrite(chronicle.Write{
 			Supersede: []chronicle.RecordID{"r1"},
-			TxAt:      tx1.Add(time.Second),
 			Insert: []chronicle.Record{{
 				ID: "r2", Kind: employee, EntityID: "e1", Data: []byte("v2"), ValidFrom: feb, ValidTo: apr, Actor: bob,
-			}},
-		})
+			}}})})
 
 		t.Run("when the stale half of the split is applied", func(t *testing.T) {
-			_, err := s.Apply(context.Background(), chronicle.Write{
+			_, err := s.Apply(context.Background(), chronicle.ApplyRequest{TxAt: tx1.Add(2 * time.Second), Plan: chronicle.StaticWrite(chronicle.Write{
 				Supersede: []chronicle.RecordID{"r1"},
-				TxAt:      tx1.Add(2 * time.Second),
 				Insert: []chronicle.Record{{
 					ID: "r3", Kind: employee, EntityID: "e1", Data: []byte("v3"), ValidFrom: feb, ValidTo: apr, Actor: alice,
-				}},
-			})
+				}}})})
 			t.Run("then the store reports a conflict", func(t *testing.T) {
 				if !errors.Is(err, chronicle.ErrConflict) {
 					t.Fatalf("Apply = %v; want ErrConflict — applying half a split against a "+
@@ -402,12 +394,12 @@ func runStore(t *testing.T, newStore Factory) {
 		rec := chronicle.Record{
 			ID: "r1", Kind: employee, EntityID: "e1", Data: []byte("original"), ValidFrom: feb, Actor: alice,
 		}
-		tx := apply(t, s, chronicle.Write{TxAt: jan, Insert: []chronicle.Record{rec}})
+		tx := apply(t, s, chronicle.ApplyRequest{TxAt: jan, Plan: chronicle.StaticWrite(chronicle.Write{Insert: []chronicle.Record{rec}})})
 
 		t.Run("when the second insertion arrives", func(t *testing.T) {
 			dup := rec
 			dup.Data = []byte("overwritten")
-			if _, err := s.Apply(context.Background(), chronicle.Write{TxAt: tx, Insert: []chronicle.Record{dup}}); err != nil {
+			if _, err := s.Apply(context.Background(), chronicle.ApplyRequest{TxAt: tx, Plan: chronicle.StaticWrite(chronicle.Write{Insert: []chronicle.Record{dup}})}); err != nil {
 				t.Fatalf("re-inserting an existing ID = %v; want nil", err)
 			}
 			t.Run("then the original is kept, because a log is append-only", func(t *testing.T) {
@@ -445,21 +437,19 @@ func seedFilterFixture(t *testing.T, newStore Factory) filterFixture {
 	s := newStore(t)
 
 	// Generation one: three records, one per entity.
-	tx1 := apply(t, s, chronicle.Write{TxAt: jan, Insert: []chronicle.Record{
+	tx1 := apply(t, s, chronicle.ApplyRequest{TxAt: jan, Plan: chronicle.StaticWrite(chronicle.Write{Insert: []chronicle.Record{
 		{ID: "a", Kind: employee, EntityID: "e1", Data: []byte("a"), ValidFrom: feb, ValidTo: apr, Actor: alice, Intent: chronicle.IntentAssert},
 		{ID: "b", Kind: employee, EntityID: "e2", Data: []byte("b"), ValidFrom: mar, ValidTo: may, Actor: bob, Intent: chronicle.IntentCorrection},
 		{ID: "c", Kind: invoice, EntityID: "i1", Data: []byte("c"), ValidFrom: apr, Actor: alice, Intent: chronicle.IntentRemainder},
-	}})
+	}})})
 
 	// Generation two closes the invoice and replaces it, so the fixture has a
 	// record with a closed transaction interval to filter on.
-	tx2 := apply(t, s, chronicle.Write{
+	tx2 := apply(t, s, chronicle.ApplyRequest{TxAt: tx1.Add(time.Second), Plan: chronicle.StaticWrite(chronicle.Write{
 		Supersede: []chronicle.RecordID{"c"},
-		TxAt:      tx1.Add(time.Second),
 		Insert: []chronicle.Record{
 			{ID: "d", Kind: invoice, EntityID: "i1", Data: []byte("d"), ValidFrom: apr, Actor: bob, Intent: chronicle.IntentAssert},
-		},
-	})
+		}})})
 	return filterFixture{store: s, tx1: tx1, tx2: tx2}
 }
 
@@ -547,18 +537,23 @@ func runPagination(t *testing.T, newStore Factory) {
 		// Twelve records land in one Apply and so share a transaction instant.
 		// That is the hard case for pagination: the leading sort key ties for
 		// every row and only the valid start and the record ID separate them.
+		//
+		// One entity each, because these are all current records and a store
+		// is entitled — required, in the Postgres adapter's case — to refuse
+		// two current records covering the same valid instant for one entity.
+		// Only the valid starts repeat, which is what the tie needs.
 		var batch []chronicle.Record
 		for i := 0; i < 12; i++ {
 			batch = append(batch, chronicle.Record{
 				ID:        chronicle.RecordID(fmt.Sprintf("g1-%02d", i)),
 				Kind:      employee,
-				EntityID:  fmt.Sprintf("e%d", i%4),
+				EntityID:  fmt.Sprintf("e%02d", i),
 				Data:      []byte("v"),
 				ValidFrom: feb.AddDate(0, i%3, 0),
 				Actor:     alice,
 			})
 		}
-		tx1 := apply(t, s, chronicle.Write{TxAt: jan, Insert: batch})
+		tx1 := apply(t, s, chronicle.ApplyRequest{TxAt: jan, Plan: chronicle.StaticWrite(chronicle.Write{Insert: batch})})
 
 		// A second generation at a later instant, so the leading key varies too.
 		var second []chronicle.Record
@@ -572,7 +567,7 @@ func runPagination(t *testing.T, newStore Factory) {
 				Actor:     bob,
 			})
 		}
-		apply(t, s, chronicle.Write{TxAt: tx1.Add(time.Second), Insert: second})
+		apply(t, s, chronicle.ApplyRequest{TxAt: tx1.Add(time.Second), Plan: chronicle.StaticWrite(chronicle.Write{Insert: second})})
 
 		for _, desc := range []bool{false, true} {
 			dir := "ascending"
@@ -702,7 +697,7 @@ func runQueryValidation(t *testing.T, newStore Factory) {
 
 		t.Run("when the store is used", func(t *testing.T) {
 			t.Run("then Apply reports the context error", func(t *testing.T) {
-				if _, err := s.Apply(ctx, chronicle.Write{}); !errors.Is(err, context.Canceled) {
+				if _, err := s.Apply(ctx, chronicle.ApplyRequest{Plan: chronicle.StaticWrite(chronicle.Write{})}); !errors.Is(err, context.Canceled) {
 					t.Fatalf("Apply = %v; want context.Canceled", err)
 				}
 			})
@@ -882,9 +877,9 @@ func runLog(t *testing.T, newStore Factory) {
 
 // apply runs a write and returns the transaction instant the store assigned,
 // which is the only transaction timestamp the suite is entitled to assume.
-func apply(t *testing.T, s chronicle.Store, w chronicle.Write) time.Time {
+func apply(t *testing.T, s chronicle.Store, req chronicle.ApplyRequest) time.Time {
 	t.Helper()
-	tx, err := s.Apply(context.Background(), w)
+	tx, err := s.Apply(context.Background(), req)
 	if err != nil {
 		t.Fatalf("Apply failed: %v", err)
 	}

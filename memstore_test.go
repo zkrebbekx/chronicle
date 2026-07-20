@@ -24,17 +24,12 @@ func newStampingStore(start time.Time) *stampingStore {
 	return &stampingStore{inner: NewMemStore(), next: start}
 }
 
-func (s *stampingStore) Apply(ctx context.Context, w Write) (time.Time, error) {
+func (s *stampingStore) Apply(ctx context.Context, req ApplyRequest) (time.Time, error) {
 	s.mu.Lock()
 	s.next = s.next.Add(time.Hour)
-	stamped := s.next
+	req.TxAt = s.next
 	s.mu.Unlock()
-
-	w.TxAt = stamped
-	for i := range w.Insert {
-		w.Insert[i].TxFrom = stamped
-	}
-	return s.inner.Apply(ctx, w)
+	return s.inner.Apply(ctx, req)
 }
 
 func (s *stampingStore) Get(ctx context.Context, q GetQuery) (*Record, error) {
@@ -53,13 +48,13 @@ type conflictStore struct {
 	attempts  int
 }
 
-func (s *conflictStore) Apply(ctx context.Context, w Write) (time.Time, error) {
+func (s *conflictStore) Apply(ctx context.Context, req ApplyRequest) (time.Time, error) {
 	s.attempts++
 	if s.remaining > 0 {
 		s.remaining--
 		return time.Time{}, conflictf("record %s was already superseded", "elsewhere")
 	}
-	return s.Store.Apply(ctx, w)
+	return s.Store.Apply(ctx, req)
 }
 
 func TestMemStore(t *testing.T) {
@@ -100,7 +95,7 @@ func TestMemStore(t *testing.T) {
 			t.Run("then the original is kept rather than overwritten", func(t *testing.T) {
 				dup := rec
 				dup.Data = []byte("overwritten")
-				if _, err := s.Apply(ctx, Write{Insert: []Record{dup}}); err != nil {
+				if _, err := s.Apply(ctx, ApplyRequest{Plan: StaticWrite(Write{Insert: []Record{dup}})}); err != nil {
 					t.Fatalf("Apply failed: %v", err)
 				}
 				if s.Len() != 1 {
@@ -117,7 +112,7 @@ func TestMemStore(t *testing.T) {
 		})
 
 		t.Run("when it is superseded", func(t *testing.T) {
-			if _, err := s.Apply(ctx, Write{Supersede: []RecordID{"r1"}, TxAt: t2}); err != nil {
+			if _, err := s.Apply(ctx, ApplyRequest{TxAt: t2, Plan: StaticWrite(Write{Supersede: []RecordID{"r1"}})}); err != nil {
 				t.Fatalf("Apply failed: %v", err)
 			}
 			t.Run("then its transaction interval is closed", func(t *testing.T) {
@@ -130,7 +125,7 @@ func TestMemStore(t *testing.T) {
 				}
 			})
 			t.Run("then superseding again is idempotent", func(t *testing.T) {
-				if _, err := s.Apply(ctx, Write{Supersede: []RecordID{"r1"}, TxAt: t4}); err != nil {
+				if _, err := s.Apply(ctx, ApplyRequest{TxAt: t4, Plan: StaticWrite(Write{Supersede: []RecordID{"r1"}})}); err != nil {
 					t.Fatalf("Apply failed: %v", err)
 				}
 				recs, _, err := s.Query(ctx, Query{})
@@ -143,16 +138,14 @@ func TestMemStore(t *testing.T) {
 				}
 			})
 			t.Run("then superseding an unknown ID is not an error", func(t *testing.T) {
-				if _, err := s.Apply(ctx, Write{Supersede: []RecordID{"nope"}, TxAt: t4}); err != nil {
+				if _, err := s.Apply(ctx, ApplyRequest{TxAt: t4, Plan: StaticWrite(Write{Supersede: []RecordID{"nope"}})}); err != nil {
 					t.Fatalf("Apply of an unknown ID = %v; want nil", err)
 				}
 			})
 			t.Run("then the same supersession alongside an insert is a conflict", func(t *testing.T) {
-				_, err := s.Apply(ctx, Write{
+				_, err := s.Apply(ctx, ApplyRequest{TxAt: t4, Plan: StaticWrite(Write{
 					Supersede: []RecordID{"r1"},
-					TxAt:      t4,
-					Insert:    []Record{{ID: "r2", Kind: employee, EntityID: "e", TxFrom: t4, Actor: alice}},
-				})
+					Insert:    []Record{{ID: "r2", Kind: employee, EntityID: "e", TxFrom: t4, Actor: alice}}})})
 				if !errors.Is(err, ErrConflict) {
 					t.Fatalf("Apply = %v; want ErrConflict — a split planned against a record "+
 						"someone else already superseded must not land half-applied", err)
@@ -162,11 +155,9 @@ func TestMemStore(t *testing.T) {
 				}
 			})
 			t.Run("then an unknown supersession alongside an insert is a conflict too", func(t *testing.T) {
-				_, err := s.Apply(ctx, Write{
+				_, err := s.Apply(ctx, ApplyRequest{TxAt: t4, Plan: StaticWrite(Write{
 					Supersede: []RecordID{"nope"},
-					TxAt:      t4,
-					Insert:    []Record{{ID: "r3", Kind: employee, EntityID: "e", TxFrom: t4, Actor: alice}},
-				})
+					Insert:    []Record{{ID: "r3", Kind: employee, EntityID: "e", TxFrom: t4, Actor: alice}}})})
 				if !errors.Is(err, ErrConflict) {
 					t.Fatalf("Apply = %v; want ErrConflict", err)
 				}
@@ -274,13 +265,13 @@ func TestMemStore(t *testing.T) {
 
 		t.Run("when it is used afterwards", func(t *testing.T) {
 			t.Run("then every operation reports ErrClosed", func(t *testing.T) {
-				if _, err := s.Apply(ctx, Write{Insert: []Record{{ID: "r2"}}}); !errors.Is(err, ErrClosed) {
+				if _, err := s.Apply(ctx, ApplyRequest{Plan: StaticWrite(Write{Insert: []Record{{ID: "r2"}}})}); !errors.Is(err, ErrClosed) {
 					t.Fatalf("Apply = %v; want ErrClosed", err)
 				}
-				if _, err := s.Apply(ctx, Write{Supersede: []RecordID{"r1"}, TxAt: t2}); !errors.Is(err, ErrClosed) {
+				if _, err := s.Apply(ctx, ApplyRequest{TxAt: t2, Plan: StaticWrite(Write{Supersede: []RecordID{"r1"}})}); !errors.Is(err, ErrClosed) {
 					t.Fatalf("Apply = %v; want ErrClosed", err)
 				}
-				if _, err := s.Apply(ctx, Write{}); !errors.Is(err, ErrClosed) {
+				if _, err := s.Apply(ctx, ApplyRequest{Plan: StaticWrite(Write{})}); !errors.Is(err, ErrClosed) {
 					t.Fatalf("Apply = %v; want ErrClosed", err)
 				}
 				if _, err := s.Get(ctx, GetQuery{}); !errors.Is(err, ErrClosed) {
@@ -304,7 +295,7 @@ func TestMemStore(t *testing.T) {
 		cancel()
 		t.Run("when the store is used", func(t *testing.T) {
 			t.Run("then every operation reports the context error", func(t *testing.T) {
-				if _, err := s.Apply(cancelled, Write{}); !errors.Is(err, context.Canceled) {
+				if _, err := s.Apply(cancelled, ApplyRequest{Plan: StaticWrite(Write{})}); !errors.Is(err, context.Canceled) {
 					t.Fatalf("Apply = %v; want context.Canceled", err)
 				}
 				if _, err := s.Get(cancelled, GetQuery{}); !errors.Is(err, context.Canceled) {
@@ -442,13 +433,11 @@ func TestMemStore(t *testing.T) {
 				defer wg.Done()
 				for i := 0; i < 50; i++ {
 					id := RecordID(fmt.Sprintf("w%d-%d", w, i))
-					_, err := s.Apply(context.Background(), Write{
-						TxAt: t2,
+					_, err := s.Apply(context.Background(), ApplyRequest{TxAt: t2, Plan: StaticWrite(Write{
 						Insert: []Record{{
 							ID: id, Kind: employee, EntityID: fmt.Sprintf("e%d", i%3),
 							Data: []byte("v"), ValidFrom: t1, ValidTo: t3, TxFrom: t1, Actor: alice,
-						}},
-					})
+						}}})})
 					if err != nil {
 						errCh <- err
 						return
@@ -525,6 +514,26 @@ func TestWriteEntities(t *testing.T) {
 			t.Run("then the list is empty, because an ID does not name its entity", func(t *testing.T) {
 				if got := (Write{Supersede: []RecordID{"r1"}}).Entities(); len(got) != 0 {
 					t.Fatalf("Entities() = %v; want none", got)
+				}
+			})
+		})
+	})
+}
+
+func TestStaticWrite(t *testing.T) {
+	t.Run("given a write that is already decided", func(t *testing.T) {
+		want := Write{
+			Supersede: []RecordID{"r1"},
+			Insert:    []Record{{ID: "r2", Kind: employee, EntityID: "e"}},
+		}
+		t.Run("when it is wrapped as a plan", func(t *testing.T) {
+			got, err := StaticWrite(want)([]Record{{ID: "ignored"}}, t2)
+			t.Run("then the current state is ignored and the write comes back unchanged", func(t *testing.T) {
+				if err != nil {
+					t.Fatalf("StaticWrite plan returned %v; want nil", err)
+				}
+				if len(got.Supersede) != 1 || got.Supersede[0] != "r1" || len(got.Insert) != 1 || got.Insert[0].ID != "r2" {
+					t.Fatalf("plan returned %+v; want %+v", got, want)
 				}
 			})
 		})

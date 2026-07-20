@@ -31,17 +31,29 @@ func (c Cursor) String() string { return string(c) }
 // without old cursors being silently misread as new ones.
 const cursorVersion = "c1"
 
-// cursorKey is a cursor's decoded position: the sort key of the last record on
-// the previous page. It mirrors the ordering in [compareRecords] exactly, so
+// CursorKey is a cursor's decoded position: the sort key of the last record on
+// the previous page. It mirrors the ordering in [CompareRecords] exactly, so
 // resuming is a matter of keeping records that sort strictly after it.
-type cursorKey struct {
-	TxFrom    time.Time
+//
+// It is exported for the benefit of [Store] implementations, which have to
+// translate a cursor into whatever their backing store's keyset predicate
+// looks like. Callers of [Log] should treat a [Cursor] as opaque and never
+// decode one.
+type CursorKey struct {
+	// TxFrom is the transaction start of the last record on the previous page.
+	TxFrom time.Time
+	// ValidFrom is its valid start. Zero means unbounded, and sorts first.
 	ValidFrom time.Time
-	ID        RecordID
+	// ID is its record ID, the final and unique tiebreaker.
+	ID RecordID
 }
 
-// encodeCursor renders a record's sort key as an opaque, checksummed token.
-func encodeCursor(r Record) Cursor {
+// EncodeCursor renders a record's sort key as an opaque, checksummed token.
+//
+// A [Store] returns one when it withholds records, and only then: a cursor
+// that comes back empty is what lets callers terminate a paging loop without a
+// trailing empty page.
+func EncodeCursor(r Record) Cursor {
 	payload := strings.Join([]string{
 		cursorVersion,
 		encodeCursorTime(r.TxFrom),
@@ -63,34 +75,37 @@ func checksumString(payload string) string {
 	return strconv.FormatUint(uint64(sum.Sum32()), 36)
 }
 
-// decodeCursor parses a token produced by encodeCursor. Every failure mode —
-// bad base64, wrong field count, wrong version, unparseable time, bad checksum
-// — reports [ErrInvalidCursor], because none of them are distinguishable to a
-// caller who is meant to treat the value as opaque.
-func decodeCursor(c Cursor) (cursorKey, error) {
+// DecodeCursor parses a token produced by [EncodeCursor], for [Store]
+// implementations that need to turn a cursor into a keyset predicate.
+//
+// Every failure mode — bad base64, wrong field count, wrong version,
+// unparseable time, bad checksum — reports [ErrInvalidCursor], because none of
+// them are distinguishable to a caller who is meant to treat the value as
+// opaque.
+func DecodeCursor(c Cursor) (CursorKey, error) {
 	raw, err := base64.RawURLEncoding.DecodeString(string(c))
 	if err != nil {
-		return cursorKey{}, &CursorError{Cursor: c, Reason: "not valid base64", Err: ErrInvalidCursor}
+		return CursorKey{}, &CursorError{Cursor: c, Reason: "not valid base64", Err: ErrInvalidCursor}
 	}
 	parts := strings.Split(string(raw), "\x1f")
 	if len(parts) != 5 {
-		return cursorKey{}, &CursorError{Cursor: c, Reason: "malformed payload", Err: ErrInvalidCursor}
+		return CursorKey{}, &CursorError{Cursor: c, Reason: "malformed payload", Err: ErrInvalidCursor}
 	}
 	if parts[0] != cursorVersion {
-		return cursorKey{}, &CursorError{Cursor: c, Reason: "unsupported cursor version " + parts[0], Err: ErrInvalidCursor}
+		return CursorKey{}, &CursorError{Cursor: c, Reason: "unsupported cursor version " + parts[0], Err: ErrInvalidCursor}
 	}
 	if parts[4] != checksumString(strings.Join(parts[:4], "\x1f")) {
-		return cursorKey{}, &CursorError{Cursor: c, Reason: "checksum mismatch", Err: ErrInvalidCursor}
+		return CursorKey{}, &CursorError{Cursor: c, Reason: "checksum mismatch", Err: ErrInvalidCursor}
 	}
 	txFrom, err := decodeCursorTime(parts[1])
 	if err != nil {
-		return cursorKey{}, &CursorError{Cursor: c, Reason: "unparseable transaction time", Err: ErrInvalidCursor}
+		return CursorKey{}, &CursorError{Cursor: c, Reason: "unparseable transaction time", Err: ErrInvalidCursor}
 	}
 	validFrom, err := decodeCursorTime(parts[2])
 	if err != nil {
-		return cursorKey{}, &CursorError{Cursor: c, Reason: "unparseable valid time", Err: ErrInvalidCursor}
+		return CursorKey{}, &CursorError{Cursor: c, Reason: "unparseable valid time", Err: ErrInvalidCursor}
 	}
-	return cursorKey{TxFrom: txFrom, ValidFrom: validFrom, ID: RecordID(parts[3])}, nil
+	return CursorKey{TxFrom: txFrom, ValidFrom: validFrom, ID: RecordID(parts[3])}, nil
 }
 
 // encodeCursorTime renders an instant, using the empty string for the zero
@@ -114,14 +129,14 @@ func decodeCursorTime(s string) (time.Time, error) {
 	return t.UTC(), nil
 }
 
-// after reports whether a record sorts strictly after the cursor position in
+// After reports whether a record sorts strictly after the cursor position in
 // the given direction. This is the whole of keyset pagination: because the
 // record ID is the final, unique tiebreaker, a record either sorts strictly
 // after the last one returned or it does not, and no record can fall through
 // the crack between two pages however many share a timestamp.
-func (k cursorKey) after(r Record, descending bool) bool {
+func (k CursorKey) After(r Record, descending bool) bool {
 	probe := Record{TxFrom: k.TxFrom, ValidFrom: k.ValidFrom, ID: k.ID}
-	c := compareRecords(r, probe)
+	c := CompareRecords(r, probe)
 	if descending {
 		return c < 0
 	}

@@ -141,16 +141,22 @@
 // carries both halves and there is no way to express them separately. A SQL
 // implementation runs Apply in one transaction.
 //
-// That transaction cannot cover the whole read-modify-write, though, because
-// chronicle reads an entity's overlapping records in a separate call before it
-// computes the split. No isolation level reaches across two calls. A store
-// shared between processes therefore detects that the pre-state moved and
-// reports [ErrConflict]; the log re-reads, re-splits and tries again, up to
-// [DefaultWriteRetries] times. See [WithWriteRetries].
+// Apply takes a plan rather than a finished write, because a write is a
+// read-modify-write and all of it has to be indivisible. The store reads the
+// entity's current overlapping records itself, under its own lock and inside
+// its own transaction, hands them to the [Planner], and applies the result
+// without releasing either. chronicle's temporal reasoning stays above the
+// store — a store never learns what a remainder is — but it runs where the
+// store can protect it. [StaticWrite] opts out, for seeding and migrations.
 //
 // Apply also returns the transaction instant it assigned, which a store with
 // more than one writing process must take from somewhere central rather than
 // from any one process's clock. The log adopts whatever comes back.
+//
+// [ErrConflict] reports a write planned against state that has since moved,
+// which a planned write cannot be but a [StaticWrite] can. The log re-reads,
+// re-splits and tries again, up to [DefaultWriteRetries] times — see
+// [WithWriteRetries].
 //
 // # Errors
 //

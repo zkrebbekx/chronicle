@@ -2,6 +2,7 @@ package chronicle
 
 import (
 	"context"
+	"errors"
 	"slices"
 	"sync"
 	"time"
@@ -59,22 +60,36 @@ func (s *MemStore) Close() error {
 	return nil
 }
 
-// Apply implements [Store]. The whole write happens under a single lock, so
-// no reader can observe the moment between closing the old records and
-// inserting the new ones — which is the moment at which an entity's valid-time
-// coverage would appear to have a hole in it.
+// Apply implements [Store]. Reading the current records, planning against
+// them, and applying the plan all happen under one lock, so no reader can
+// observe the moment between closing the old records and inserting the new
+// ones — which is the moment at which an entity's valid-time coverage would
+// appear to have a hole in it — and no second writer can plan against a
+// pre-state this write is in the middle of replacing.
 //
 // MemStore accepts the log's proposed transaction instant and returns it
 // unchanged. It can: a MemStore has exactly one process writing to it, so the
 // log's ratchet is authoritative. A store shared between processes must assign
 // transaction time itself.
-func (s *MemStore) Apply(ctx context.Context, w Write) (time.Time, error) {
+func (s *MemStore) Apply(ctx context.Context, req ApplyRequest) (time.Time, error) {
 	if err := ctx.Err(); err != nil {
 		return time.Time{}, err
 	}
-	txAt := w.TxAt.UTC()
+	if req.Plan == nil {
+		return time.Time{}, errors.New("chronicle: ApplyRequest needs a Plan")
+	}
+	txAt := req.TxAt.UTC()
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.closed {
+		return time.Time{}, ErrClosed
+	}
+
+	w, err := req.Plan(s.currentLocked(req.Entity, req.Valid), txAt)
+	if err != nil {
+		return time.Time{}, err
+	}
 	if err := s.supersedeLocked(w.Supersede, txAt, len(w.Insert) > 0); err != nil {
 		return time.Time{}, err
 	}
@@ -82,6 +97,30 @@ func (s *MemStore) Apply(ctx context.Context, w Write) (time.Time, error) {
 		return time.Time{}, err
 	}
 	return txAt, nil
+}
+
+// currentLocked returns deep copies of the entity's current records whose
+// valid interval overlaps valid, in chronicle's total order.
+//
+// A zero entity means the write was not planned from existing state, and the
+// planner gets nothing rather than the whole log — see [ApplyRequest.Entity].
+func (s *MemStore) currentLocked(ref EntityRef, valid Interval) []Record {
+	if ref.Kind == "" && ref.EntityID == "" {
+		return nil
+	}
+	var out []Record
+	for _, idx := range s.byEntry[entityKey{kind: ref.Kind, entityID: ref.EntityID}] {
+		r := s.recs[idx]
+		if !r.IsCurrent() {
+			continue
+		}
+		if !valid.IsAlways() && !r.Valid().Overlaps(valid) {
+			continue
+		}
+		out = append(out, r.Clone())
+	}
+	slices.SortFunc(out, CompareRecords)
+	return out
 }
 
 // insertLocked adds records, stamping each with the write's transaction
@@ -161,7 +200,7 @@ func (s *MemStore) Get(ctx context.Context, q GetQuery) (*Record, error) {
 		if !r.Valid().Contains(q.ValidAt) || !r.Tx().Contains(q.TxAt) {
 			continue
 		}
-		if best == nil || compareRecords(r, *best) < 0 {
+		if best == nil || CompareRecords(r, *best) < 0 {
 			clone := r.Clone()
 			best = &clone
 		}
@@ -182,14 +221,14 @@ func (s *MemStore) Query(ctx context.Context, q Query) ([]Record, Cursor, error)
 	if err := ctx.Err(); err != nil {
 		return nil, NoCursor, err
 	}
-	if err := q.validate(); err != nil {
+	if err := q.Validate(); err != nil {
 		return nil, NoCursor, err
 	}
 
-	var key cursorKey
+	var key CursorKey
 	haveCursor := !q.After.IsZero()
 	if haveCursor {
-		k, err := decodeCursor(q.After)
+		k, err := DecodeCursor(q.After)
 		if err != nil {
 			return nil, NoCursor, err
 		}
@@ -208,10 +247,10 @@ func (s *MemStore) Query(ctx context.Context, q Query) ([]Record, Cursor, error)
 	// at a small page size does not clone the whole result set per page.
 	var matched []Record
 	for _, r := range s.candidatesLocked(q) {
-		if !q.matches(r) {
+		if !q.Matches(r) {
 			continue
 		}
-		if haveCursor && !key.after(r, q.Descending) {
+		if haveCursor && !key.After(r, q.Descending) {
 			continue
 		}
 		matched = append(matched, r)
@@ -219,9 +258,9 @@ func (s *MemStore) Query(ctx context.Context, q Query) ([]Record, Cursor, error)
 
 	slices.SortFunc(matched, func(a, b Record) int {
 		if q.Descending {
-			return compareRecords(b, a)
+			return CompareRecords(b, a)
 		}
-		return compareRecords(a, b)
+		return CompareRecords(a, b)
 	})
 
 	// A cursor is returned only when records were actually withheld. Callers
@@ -234,7 +273,7 @@ func (s *MemStore) Query(ctx context.Context, q Query) ([]Record, Cursor, error)
 
 	out := cloneRecords(matched)
 	if truncated {
-		return out, encodeCursor(out[len(out)-1]), nil
+		return out, EncodeCursor(out[len(out)-1]), nil
 	}
 	return out, NoCursor, nil
 }

@@ -2,10 +2,11 @@ package chronicle
 
 import (
 	"context"
-	"crypto/rand"
+	cryptorand "crypto/rand"
 	"encoding/hex"
 	"errors"
 	"maps"
+	"math/rand/v2"
 	"strconv"
 	"strings"
 	"sync"
@@ -164,7 +165,7 @@ func NewLog(store Store, opts ...Option) *Log {
 // not a security boundary and does not need to be unguessable, only distinct.
 func newNodeToken() string {
 	var b [5]byte
-	if _, err := rand.Read(b[:]); err != nil {
+	if _, err := cryptorand.Read(b[:]); err != nil {
 		// crypto/rand does not fail on any supported platform, and a log that
 		// refused to start because of it would be worse than one whose IDs are
 		// merely time-and-sequence unique within the process.
@@ -321,17 +322,12 @@ func (l *Log) write(ctx context.Context, kind, entityID string, data []byte, val
 		opt(&o)
 	}
 
-	// The whole read-modify-write runs under the log's write lock. That is
-	// what makes the overlap scan and the write it computes a single decision
-	// within this process: without it two concurrent writers to one entity
-	// could both scan the same pre-state and each split it, leaving two
-	// current records covering the same valid instant.
-	//
-	// The lock says nothing about other processes, and it cannot: the scan and
-	// the Apply are separate calls, so no store transaction spans them and no
-	// isolation level can protect the pair. A store shared between processes
-	// detects the stale pre-state instead and reports ErrConflict, which is
-	// what this loop exists to answer.
+	// The log's write lock keeps this process's writes to any entity in a
+	// single file, which is what makes the sequence numbers in record IDs
+	// meaningful. It does nothing about other processes, and it does not need
+	// to: the overlap scan happens inside the store's own transaction, under
+	// the store's own lock, so the split is planned against state no one else
+	// can be in the middle of replacing.
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
@@ -344,6 +340,10 @@ func (l *Log) write(ctx context.Context, kind, entityID string, data []byte, val
 		if !errors.Is(err, ErrConflict) {
 			return Result{}, err
 		}
+		// A conflict should not happen: the store planned this write from
+		// state it held a lock over. It can still, if something outside
+		// chronicle wrote an overlapping record into the same table, and the
+		// honest response to that is to look again rather than to insist.
 		lastConflict = err
 		if attempt >= l.retries {
 			return Result{}, &ConflictError{
@@ -352,79 +352,107 @@ func (l *Log) write(ctx context.Context, kind, entityID string, data []byte, val
 				Err:      lastConflict,
 			}
 		}
+		if err := sleepBackoff(ctx, attempt); err != nil {
+			return Result{}, err
+		}
 	}
 }
 
-// attemptLocked is one pass of the read-modify-write: scan the overlapping
-// records, compute the split, apply it. It is separated from write so that a
-// conflict can discard the whole computation and start again from a fresh
-// scan, which is the only way to plan against state that has moved.
+// backoffBase and backoffCap bound the pause between retries.
+const (
+	backoffBase = 200 * time.Microsecond
+	backoffCap  = 10 * time.Millisecond
+)
+
+// sleepBackoff pauses before recomputing a write that lost a race.
+//
+// The jitter is the point rather than the delay. Two writers recomputing the
+// moment they lose arrive together again and lose again, so a fixed pause
+// preserves whatever phase they were already in; a random one breaks it. The
+// doubling keeps a genuinely hot entity from spinning.
+func sleepBackoff(ctx context.Context, attempt int) error {
+	window := backoffBase << min(attempt, 6)
+	if window > backoffCap {
+		window = backoffCap
+	}
+	timer := time.NewTimer(rand.N(window) + time.Microsecond)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+// attemptLocked is one pass of the write: hand the store a plan, let it read
+// the overlapping records under its own lock, compute the split against what
+// it read, and apply the result in the same transaction.
+//
+// The split is computed inside the planner rather than before it, which is the
+// whole point. A plan built from records read in an earlier call describes a
+// state that may already have moved; a plan built from records the store is
+// holding a lock over cannot.
 func (l *Log) attemptLocked(ctx context.Context, kind, entityID string, data []byte, valid Interval, actor Actor, intent Intent, o writeOpts) (Result, error) {
 	txNow := l.tickLocked()
 
-	// No limit: the overlap set is bounded by one entity's current records,
-	// which the non-overlap invariant already keeps to the number of distinct
-	// segments in its valid timeline.
-	overlapping, _, err := l.store.Query(ctx, Query{
-		Kind:        kind,
-		EntityID:    entityID,
-		CurrentOnly: true,
-		Valid:       valid,
+	var (
+		inserts    []Record
+		superseded []RecordID
+	)
+	plan := func(overlapping []Record, txAt time.Time) (Write, error) {
+		// Record IDs lead with the transaction instant, so they are minted
+		// here, against the instant the store settled on, rather than against
+		// the one this log proposed.
+		inserts = make([]Record, 0, 1+2*len(overlapping))
+		inserts = append(inserts, Record{
+			ID:        l.nextIDLocked(txAt),
+			EntityID:  entityID,
+			Kind:      kind,
+			Data:      data,
+			ValidFrom: valid.From,
+			ValidTo:   valid.To,
+			TxFrom:    txAt,
+			Actor:     actor,
+			Reason:    o.reason,
+			Intent:    intent,
+			Meta:      o.meta,
+		})
+
+		superseded = make([]RecordID, 0, len(overlapping))
+		for _, r := range overlapping {
+			superseded = append(superseded, r.ID)
+
+			// Left remainder: the part of r that starts before the new interval.
+			if r.Valid().StartsBefore(valid) {
+				inserts = append(inserts, l.remainderLocked(r, Interval{From: r.ValidFrom, To: valid.From}, txAt))
+			}
+			// Right remainder: the part of r that outlasts the new interval. An
+			// unbounded r always has one unless the new interval is unbounded too,
+			// which is exactly what ExtendsBeyond encodes.
+			if r.Valid().ExtendsBeyond(valid) {
+				inserts = append(inserts, l.remainderLocked(r, Interval{From: valid.To, To: r.ValidTo}, txAt))
+			}
+		}
+		return Write{Supersede: superseded, Insert: inserts}, nil
+	}
+
+	txAt, err := l.store.Apply(ctx, ApplyRequest{
+		Entity: EntityRef{Kind: kind, EntityID: entityID},
+		Valid:  valid,
+		TxAt:   txNow,
+		Plan:   plan,
 	})
 	if err != nil {
 		return Result{}, err
 	}
 
-	inserts := make([]Record, 0, 1+2*len(overlapping))
-	inserts = append(inserts, Record{
-		ID:        l.nextIDLocked(txNow),
-		EntityID:  entityID,
-		Kind:      kind,
-		Data:      data,
-		ValidFrom: valid.From,
-		ValidTo:   valid.To,
-		TxFrom:    txNow,
-		Actor:     actor,
-		Reason:    o.reason,
-		Intent:    intent,
-		Meta:      o.meta,
-	})
-
-	superseded := make([]RecordID, 0, len(overlapping))
-	for _, r := range overlapping {
-		superseded = append(superseded, r.ID)
-
-		// Left remainder: the part of r that starts before the new interval.
-		if r.Valid().StartsBefore(valid) {
-			inserts = append(inserts, l.remainderLocked(r, Interval{From: r.ValidFrom, To: valid.From}, txNow))
-		}
-		// Right remainder: the part of r that outlasts the new interval. An
-		// unbounded r always has one unless the new interval is unbounded too,
-		// which is exactly what ExtendsBeyond encodes.
-		if r.Valid().ExtendsBeyond(valid) {
-			inserts = append(inserts, l.remainderLocked(r, Interval{From: valid.To, To: r.ValidTo}, txNow))
-		}
-	}
-
-	txAt, err := l.store.Apply(ctx, Write{Supersede: superseded, TxAt: txNow, Insert: inserts})
-	if err != nil {
-		return Result{}, err
-	}
-
-	// The store has the last word on transaction time. Where it substituted
-	// its own instant — which any store with more than one writing process
-	// must — the records this log built carry the proposal rather than the
-	// truth, so they are restamped before anyone sees them, and the ratchet is
-	// pulled forward so that a subsequent read's notion of "now" sits after
-	// the write that just happened rather than before it.
+	// The store has the last word on transaction time, and the ratchet is
+	// pulled forward to match so that a subsequent read's notion of "now" sits
+	// after the write that just happened rather than before it.
 	txAt = txAt.UTC()
 	if txAt.IsZero() {
 		txAt = txNow
-	}
-	if txAt != txNow {
-		for i := range inserts {
-			inserts[i].TxFrom = txAt
-		}
 	}
 	if txAt.After(l.lastTx) {
 		l.lastTx = txAt

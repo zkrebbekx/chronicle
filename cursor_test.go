@@ -29,7 +29,7 @@ func seedRecords(t *testing.T, store *MemStore, recs []Record) {
 		groups[r.TxFrom] = append(groups[r.TxFrom], r)
 	}
 	for _, tx := range order {
-		if _, err := store.Apply(context.Background(), Write{TxAt: tx, Insert: groups[tx]}); err != nil {
+		if _, err := store.Apply(context.Background(), ApplyRequest{TxAt: tx, Plan: StaticWrite(Write{Insert: groups[tx]})}); err != nil {
 			t.Fatalf("seeding the store failed: %v", err)
 		}
 	}
@@ -299,8 +299,8 @@ func TestPagination(t *testing.T) {
 				for _, bad := range []string{"not-a-time\x1f\x1fid", "\x1fnot-a-time\x1fid"} {
 					payload := "c1\x1f" + bad
 					c := Cursor(base64.RawURLEncoding.EncodeToString([]byte(payload + "\x1f" + checksumOf(payload))))
-					if _, err := decodeCursor(c); !errors.Is(err, ErrInvalidCursor) {
-						t.Fatalf("decodeCursor(%q) = %v; want ErrInvalidCursor", payload, err)
+					if _, err := DecodeCursor(c); !errors.Is(err, ErrInvalidCursor) {
+						t.Fatalf("DecodeCursor(%q) = %v; want ErrInvalidCursor", payload, err)
 					}
 				}
 			})
@@ -317,9 +317,9 @@ func TestPagination(t *testing.T) {
 		for _, rec := range cases {
 			t.Run("when the record is "+string(rec.ID), func(t *testing.T) {
 				t.Run("then it decodes to the same key", func(t *testing.T) {
-					got, err := decodeCursor(encodeCursor(rec))
+					got, err := DecodeCursor(EncodeCursor(rec))
 					if err != nil {
-						t.Fatalf("decodeCursor failed: %v", err)
+						t.Fatalf("DecodeCursor failed: %v", err)
 					}
 					if got.ID != rec.ID || !got.TxFrom.Equal(rec.TxFrom) || !got.ValidFrom.Equal(rec.ValidFrom) {
 						t.Fatalf("round trip = %+v; want %s / %s / %s", got, rec.ID, rec.TxFrom, rec.ValidFrom)

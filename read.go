@@ -192,7 +192,7 @@ func (l *Log) Timeline(ctx context.Context, kind, entityID string, as As) ([]Rec
 		if c := compareStarts(a.ValidFrom, b.ValidFrom); c != 0 {
 			return c
 		}
-		return compareRecords(a, b)
+		return CompareRecords(a, b)
 	})
 	return recs, nil
 }

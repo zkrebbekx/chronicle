@@ -33,36 +33,44 @@ import (
 //
 // # Isolation
 //
-// chronicle reads an entity's overlapping records, computes a split, and then
-// calls Apply. Those two steps are separate calls, so an implementation cannot
-// protect the read with the write's transaction. It must instead detect that
-// the pre-state changed underneath it and report [ErrConflict]; [Log] retries
-// the whole read-modify-write when it sees one. Implementations backed by a
-// database should take a per-entity lock for the duration of Apply and rely on
-// a deferrable exclusion constraint to catch anything the lock missed.
+// A write to one entity is a read-modify-write: chronicle reads the records
+// whose valid intervals overlap the new one, computes how to split them, and
+// applies the result. All three parts have to be one indivisible step, or two
+// writers can observe the same pre-state and each split it.
+//
+// Apply therefore takes a *plan* rather than a finished write. The store reads
+// the current overlapping records itself, inside its own transaction and under
+// whatever lock it uses, hands them to the plan, and applies what comes back
+// without ever releasing either. chronicle's temporal reasoning stays above the
+// store — the store never learns what a remainder is — but the reasoning runs
+// where the store can protect it.
+//
+// An earlier shape had the log read through Query and pass a finished Write to
+// Apply. It was correct and it starved: with the read outside the lock, the
+// writer that waits for the lock always finds its plan stale, so under
+// sustained contention one writer wins every race and the other never lands a
+// write at all. That is not a tuning problem, and no isolation level fixes it,
+// because no isolation level spans two separate calls.
 type Store interface {
-	// Apply performs the whole of a write: it closes the transaction interval
-	// of every record named in Supersede, then inserts every record in Insert.
-	// Either all of it is visible to a subsequent read, or none of it is.
+	// Apply computes and applies one indivisible change.
 	//
-	// Apply owns the transaction axis. It picks one instant for the write,
-	// stamps it on every inserted record's TxFrom and every superseded
-	// record's TxTo, and returns it. Whatever TxFrom an inserted record
-	// arrives carrying is overwritten, so there is no path by which a caller
-	// can choose when the log appears to have learned something — which is the
-	// only reason the transaction axis is worth trusting.
+	// It reads the current records for req.Entity whose valid intervals
+	// overlap req.Valid, passes them to req.Plan along with the transaction
+	// instant it has assigned, and applies the returned [Write]: every record
+	// named in Supersede has its transaction interval closed, and every record
+	// in Insert is added. Either all of it is visible to a subsequent read, or
+	// none of it is. The read and the write share one transaction and one
+	// lock, so the plan cannot go stale between them.
 	//
-	// Write.TxAt is a proposal. A single-writer store may adopt it; a store
-	// with more than one writing process must not, since no one process's
-	// clock is authoritative, and takes the instant from somewhere both
-	// writers agree on instead. [Log] treats the returned instant as the
-	// truth either way.
+	// Apply owns the transaction axis. It picks the instant, stamps it on
+	// every inserted record's TxFrom and every superseded record's TxTo, and
+	// returns it. Whatever TxFrom an inserted record arrives carrying is
+	// overwritten, so there is no path by which a caller can choose when the
+	// log appears to have learned something — which is the only reason the
+	// transaction axis is worth trusting.
 	//
-	// Apply reports an error wrapping [ErrConflict] when the write was
-	// computed against a pre-state that no longer holds — typically because a
-	// record it meant to supersede has already been superseded by someone
-	// else. Nothing is applied in that case.
-	Apply(ctx context.Context, w Write) (time.Time, error)
+	// An error from the plan is returned unchanged and nothing is applied.
+	Apply(ctx context.Context, req ApplyRequest) (time.Time, error)
 
 	// Get returns the single record covering the given point on both axes, or
 	// an error wrapping [ErrNotFound]. Where the log's invariant holds, at
@@ -75,29 +83,71 @@ type Store interface {
 	Query(ctx context.Context, q Query) ([]Record, Cursor, error)
 }
 
-// Write is one indivisible unit of change, as handed to [Store.Apply].
+// ApplyRequest describes one indivisible change as a plan for the store to
+// compute, rather than as a finished write for it to carry out.
+type ApplyRequest struct {
+	// Entity is the entity being written, and the granularity at which the
+	// store locks. A zero Entity means the write is not planned from existing
+	// state: Plan is called with no current records, and the store locks only
+	// what the resulting write turns out to touch. Use it for seeding and
+	// migration, never for an ordinary write, since it gives up exactly the
+	// protection the planning form exists to provide.
+	Entity EntityRef
+
+	// Valid narrows the current records handed to Plan to those whose valid
+	// interval overlaps it. The zero interval covers all of time.
+	Valid Interval
+
+	// TxAt is the transaction instant the log proposes. It is a proposal: a
+	// single-writer store may adopt it, and a store with more than one writing
+	// process must not, since no one process's clock is authoritative. The
+	// instant the store settles on is what Plan is given and what Apply
+	// returns.
+	TxAt time.Time
+
+	// Plan computes the write. It must not block, must not touch the store,
+	// and must confine itself to Entity — the store locked that and nothing
+	// else, so records written for another entity are unprotected.
+	Plan Planner
+}
+
+// Planner computes a write from an entity's current records and the
+// transaction instant the store has assigned.
+//
+// current holds the entity's records that are still current belief and whose
+// valid interval overlaps the request's, read inside the store's transaction
+// under its lock. It is ordered by chronicle's total order and the planner may
+// retain it; stores hand over copies.
+//
+// txAt is the instant the store has settled on. A planner that mints record
+// IDs from the transaction time should use this one rather than any it chose
+// beforehand.
+type Planner func(current []Record, txAt time.Time) (Write, error)
+
+// StaticWrite returns a [Planner] that ignores the current state and applies w
+// exactly as given.
+//
+// It is for seeding fixtures, for migrations, and for tests — anywhere the
+// write is already decided. It is not for ordinary writes: planning from state
+// the store read under its own lock is the entire mechanism by which two
+// writers to one entity cannot both split the same pre-state, and a static
+// write opts out of it.
+func StaticWrite(w Write) Planner {
+	return func([]Record, time.Time) (Write, error) { return w, nil }
+}
+
+// Write is one indivisible unit of change, as returned by a [Planner].
 type Write struct {
 	// Supersede names the records whose transaction interval is to be closed.
 	// A record already closed keeps the timestamp it was closed with:
-	// transaction time, once assigned, is never rewritten.
+	// transaction time, once assigned, is never rewritten, and naming one that
+	// no longer exists is not an error.
 	//
-	// Whether a target that is missing or already closed is an error depends
-	// on what else the write does. On its own, a supersession is idempotent
-	// and such a target is ignored, so that a retry cannot rewrite a
-	// transaction timestamp. Alongside insertions it is one half of a split,
-	// and a target that has moved means the split was planned against a
-	// pre-state that no longer holds — applying the other half would leave the
-	// entity's valid timeline overlapping — so the store reports [ErrConflict]
-	// and applies nothing.
+	// A planner given the store's own reading of the current records has no
+	// way to name a record that has since moved, which is the point. A
+	// [StaticWrite] does, and a store may then report [ErrConflict] rather
+	// than apply half of a split.
 	Supersede []RecordID
-	// TxAt is the transaction instant the log proposes for the write: the TxTo
-	// of everything superseded and the TxFrom of everything inserted, so that
-	// the belief transition happens at a single point on the transaction axis
-	// with no gap and no overlap.
-	//
-	// It is a proposal. The store picks the instant it actually uses, applies
-	// it to both halves of the write, and returns it — see [Store.Apply].
-	TxAt time.Time
 	// Insert holds the records to add: the caller's new record, plus any
 	// remainders preserving the parts of superseded intervals the new record
 	// did not cover.
@@ -209,11 +259,14 @@ type Query struct {
 	Descending bool
 }
 
-// matches reports whether a record satisfies the query's filters, ignoring
-// ordering, cursor and limit. It is exported to store implementations only in
-// the sense that they live in this package; a SQL store would translate the
-// same predicates into its WHERE clause.
-func (q Query) matches(r Record) bool {
+// Matches reports whether a record satisfies the query's filters, ignoring
+// ordering, cursor and limit.
+//
+// A [Store] backed by a database translates the same predicates into its WHERE
+// clause instead. This is the definition they must agree with, and the reason
+// it is exported: the conformance suite checks the agreement, and a store
+// author needs something to check against.
+func (q Query) Matches(r Record) bool {
 	if q.Kind != "" && r.Kind != q.Kind {
 		return false
 	}
@@ -244,8 +297,14 @@ func (q Query) matches(r Record) bool {
 	return true
 }
 
-// validate checks the query's intervals and cursor shape.
-func (q Query) validate() error {
+// Validate checks the query's filters for coherence: neither time range may be
+// empty or inverted, and the intent filter must name an intent chronicle
+// defines.
+//
+// A [Store] should call it before touching its backing store, so that a
+// malformed query is the same error from every implementation rather than
+// whatever the database happened to say about it.
+func (q Query) Validate() error {
 	if err := q.Valid.Validate(); err != nil {
 		return &IntervalError{Field: "valid", Interval: q.Valid, Err: ErrInvalidInterval}
 	}
@@ -258,10 +317,10 @@ func (q Query) validate() error {
 	return nil
 }
 
-// compareRecords imposes chronicle's total order: transaction start, then
+// CompareRecords imposes chronicle's total order: transaction start, then
 // valid start, then record ID. Because IDs are unique this never returns zero
 // for two distinct records, which is what makes keyset pagination exact.
-func compareRecords(a, b Record) int {
+func CompareRecords(a, b Record) int {
 	if c := a.TxFrom.Compare(b.TxFrom); c != 0 {
 		return c
 	}
