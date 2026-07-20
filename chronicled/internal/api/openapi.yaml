@@ -1,0 +1,854 @@
+# chronicled — hand-written OpenAPI description. Maintained alongside the
+# handlers; a test fails if a routed path is missing here. No codegen.
+openapi: 3.0.3
+info:
+  title: chronicled
+  description: |
+    Bitemporal entity change history over HTTP: chronicle as a standalone
+    service, for deployments that cannot import the Go library.
+
+    Two time axes run through everything. **Valid time** is when a fact was
+    true in the world; the caller supplies it. **Transaction time** is when
+    the service learned it; the server assigns it and no request can set it.
+    Both axes are half-open `[from, to)`, and an absent bound is an unbounded
+    one.
+
+    Two conventions about absent instants, deliberately different:
+    * On point lookups (`GET /v1/{kind}/{entity}`, `diff`, `timeline`) an
+      absent instant means **now** — they are questions about the present
+      unless pinned.
+    * On the cross-entity scan (`GET /v1/records`) an absent time filter
+      means **no restriction** — a scan that defaulted to "now" would hide
+      everything superseded, which is most of an audit log.
+
+    Authentication is a static bearer-token table; each token maps to the
+    actor it writes as and a role (`writer` or `admin`). There is no actor
+    field in any request body — sending one is a 400. This is API-key
+    authentication for a single trust zone; put mTLS or an OIDC-aware proxy
+    in front for anything bigger.
+
+    Timestamps are emitted as RFC 3339 UTC with nanosecond syntax, but the
+    PostgreSQL store holds microseconds, so values round-trip at microsecond
+    precision.
+  version: "0.1.0"
+  license:
+    name: MIT
+servers:
+  - url: /
+security:
+  - bearer: []
+tags:
+  - name: records
+    description: Writes and bitemporal reads for one entity
+  - name: query
+    description: Cross-entity search
+  - name: holds
+    description: Legal holds (admin)
+  - name: retention
+    description: Retention sweeps (admin)
+  - name: tamper-evidence
+    description: Hash-chain verification (admin; meaningful only when the server runs with CHRONICLED_CHAINING=on)
+  - name: erasure
+    description: Crypto-shredding (admin)
+  - name: system
+    description: Health and metadata
+
+paths:
+  /v1/{kind}/{entity}/records:
+    post:
+      tags: [records]
+      summary: Assert entity state over a valid interval (Put)
+      description: |
+        Records that the entity had this state over `[validFrom, validTo)`,
+        as of now in transaction time. Nothing is destroyed: current records
+        overlapping the interval are superseded, and uncovered parts are
+        rewritten as remainder records. The actor is stamped from the token.
+      operationId: putRecord
+      parameters:
+        - $ref: '#/components/parameters/kind'
+        - $ref: '#/components/parameters/entity'
+      requestBody:
+        $ref: '#/components/requestBodies/write'
+      responses:
+        '201':
+          description: The write, as stored.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Result' }
+        '400': { $ref: '#/components/responses/badRequest' }
+        '401': { $ref: '#/components/responses/unauthorized' }
+        '409': { $ref: '#/components/responses/conflict' }
+        '410':
+          description: The named subject's key has been destroyed (`key_destroyed`).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /v1/{kind}/{entity}/corrections:
+    post:
+      tags: [records]
+      summary: Correct a prior belief (Correct)
+      description: |
+        Identical to a put in storage effect, but the record is marked with
+        intent `correction` — the flag that makes a retroactive fix
+        distinguishable from an ordinary late-arriving fact, and "when did we
+        discover we were wrong" answerable.
+      operationId: correctRecord
+      parameters:
+        - $ref: '#/components/parameters/kind'
+        - $ref: '#/components/parameters/entity'
+      requestBody:
+        $ref: '#/components/requestBodies/write'
+      responses:
+        '201':
+          description: The correction, as stored.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Result' }
+        '400': { $ref: '#/components/responses/badRequest' }
+        '401': { $ref: '#/components/responses/unauthorized' }
+        '409': { $ref: '#/components/responses/conflict' }
+        '410':
+          description: The named subject's key has been destroyed (`key_destroyed`).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /v1/{kind}/{entity}:
+    get:
+      tags: [records]
+      summary: Point lookup on both axes (Get)
+      description: |
+        The single record in force at (`validAt`, `txAt`). Absent instants
+        mean now. Pinning `txAt` to a past instant answers "what did we
+        believe then" — the question uni-temporal systems answer wrongly.
+        Encrypted records are decrypted transparently while the subject's key
+        survives; after key destruction this endpoint is 410 `shredded`.
+      operationId: getRecord
+      parameters:
+        - $ref: '#/components/parameters/kind'
+        - $ref: '#/components/parameters/entity'
+        - { name: validAt, in: query, schema: { type: string, format: date-time }, description: Instant on the valid axis; absent = now. }
+        - { name: txAt, in: query, schema: { type: string, format: date-time }, description: Instant on the transaction axis; absent = now. }
+      responses:
+        '200':
+          description: The record in force at that bitemporal point.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Record' }
+        '400': { $ref: '#/components/responses/badRequest' }
+        '401': { $ref: '#/components/responses/unauthorized' }
+        '404':
+          description: No coverage at that point (`not_found`); detail carries the resolved coordinates.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '410':
+          description: The record's subject key has been destroyed (`shredded`).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /v1/{kind}/{entity}/history:
+    get:
+      tags: [records]
+      summary: Every version ever recorded (History)
+      description: |
+        The raw log for one entity, superseded records included, ordered by
+        transaction start then valid start. An unknown entity is an empty
+        history, not a 404. Records are returned as stored: after a subject
+        is shredded its records appear with `dataBase64` (ciphertext) rather
+        than `data` — the view keeps working, the values do not.
+      operationId: getHistory
+      parameters:
+        - $ref: '#/components/parameters/kind'
+        - $ref: '#/components/parameters/entity'
+        - { name: currentOnly, in: query, schema: { type: boolean }, description: Only records that are still current belief. }
+        - { name: validFrom, in: query, schema: { type: string, format: date-time }, description: With validTo, restricts to records whose valid interval overlaps the range. }
+        - { name: validTo, in: query, schema: { type: string, format: date-time } }
+        - { name: txFrom, in: query, schema: { type: string, format: date-time }, description: With txTo, restricts to beliefs held during the range. }
+        - { name: txTo, in: query, schema: { type: string, format: date-time } }
+        - { name: intent, in: query, schema: { type: string, enum: [assert, correction, remainder] } }
+        - { name: actorId, in: query, schema: { type: string } }
+        - { name: limit, in: query, schema: { type: integer, minimum: 0 } }
+        - { name: descending, in: query, schema: { type: boolean } }
+      responses:
+        '200':
+          description: The matching records.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Records' }
+        '400': { $ref: '#/components/responses/badRequest' }
+        '401': { $ref: '#/components/responses/unauthorized' }
+
+  /v1/{kind}/{entity}/timeline:
+    get:
+      tags: [records]
+      summary: Valid-time sequence at one belief instant (Timeline)
+      description: |
+        The run of records that tiled the entity's valid timeline as believed
+        at `txAt` (absent = now), ordered by valid start. Taken at two
+        different `txAt` values this is the clearest view of what a
+        correction did — the same stretch of valid time, tiled differently.
+      operationId: getTimeline
+      parameters:
+        - $ref: '#/components/parameters/kind'
+        - $ref: '#/components/parameters/entity'
+        - { name: txAt, in: query, schema: { type: string, format: date-time }, description: Belief instant; absent = now. }
+      responses:
+        '200':
+          description: The timeline at that belief instant.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Records' }
+        '400': { $ref: '#/components/responses/badRequest' }
+        '401': { $ref: '#/components/responses/unauthorized' }
+
+  /v1/{kind}/{entity}/diff:
+    get:
+      tags: [records]
+      summary: Field-level changes between two bitemporal points (Diff)
+      description: |
+        Compares the entity's state at two points, each resolved
+        independently on both axes (absent instants mean now). Changes are
+        reported per field as RFC 6901 JSON Pointer paths. Arrays compare by
+        position — a stated rule rather than a guessed alignment. A record
+        that exists but cannot be decoded is 422 `codec`, never an empty
+        diff.
+      operationId: getDiff
+      parameters:
+        - $ref: '#/components/parameters/kind'
+        - $ref: '#/components/parameters/entity'
+        - { name: fromValidAt, in: query, schema: { type: string, format: date-time } }
+        - { name: fromTxAt, in: query, schema: { type: string, format: date-time } }
+        - { name: toValidAt, in: query, schema: { type: string, format: date-time } }
+        - { name: toTxAt, in: query, schema: { type: string, format: date-time } }
+      responses:
+        '200':
+          description: The delta between the two points.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Delta' }
+        '400': { $ref: '#/components/responses/badRequest' }
+        '401': { $ref: '#/components/responses/unauthorized' }
+        '404':
+          description: The entity had no state at either point (`not_found`).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '410':
+          description: A compared record's subject key has been destroyed (`shredded`).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '422':
+          description: A record exists but its data could not be decoded (`codec`).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /v1/records:
+    get:
+      tags: [query]
+      summary: Cross-entity search (Query)
+      description: |
+        Filtered scan across all entities, paginated with an opaque keyset
+        cursor. Absent time filters mean **no restriction** (not "now").
+        Results are totally ordered — transaction start, valid start, record
+        ID — so pagination can neither skip nor repeat a row. The default
+        page size is 100 and the maximum 1000; pass the returned `cursor`
+        back verbatim to resume. A response without a `cursor` field is the
+        last page.
+      operationId: queryRecords
+      parameters:
+        - { name: kind, in: query, schema: { type: string } }
+        - { name: entityId, in: query, schema: { type: string }, description: Meaningful alongside kind, since entity IDs are scoped by kind. }
+        - { name: actorId, in: query, schema: { type: string } }
+        - { name: intent, in: query, schema: { type: string, enum: [assert, correction, remainder] } }
+        - { name: validAt, in: query, schema: { type: string, format: date-time }, description: Records whose valid interval contains this instant. }
+        - { name: txAt, in: query, schema: { type: string, format: date-time }, description: Records whose transaction interval contains this instant. }
+        - { name: validFrom, in: query, schema: { type: string, format: date-time }, description: With validTo, records whose valid interval overlaps the range. }
+        - { name: validTo, in: query, schema: { type: string, format: date-time } }
+        - { name: txFrom, in: query, schema: { type: string, format: date-time }, description: With txTo, records whose transaction interval overlaps the range. }
+        - { name: txTo, in: query, schema: { type: string, format: date-time } }
+        - { name: currentOnly, in: query, schema: { type: boolean } }
+        - { name: limit, in: query, schema: { type: integer, minimum: 0, maximum: 1000 }, description: Page size; 0 or absent = 100. }
+        - { name: cursor, in: query, schema: { type: string }, description: Opaque resumption token from a previous page. URL-encode it. }
+        - { name: descending, in: query, schema: { type: boolean }, description: Must match the setting the cursor was produced under. }
+      responses:
+        '200':
+          description: One page of records.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Records' }
+        '400': { $ref: '#/components/responses/badRequest' }
+        '401': { $ref: '#/components/responses/unauthorized' }
+
+  /v1/holds:
+    post:
+      tags: [holds]
+      summary: Place a legal hold (admin)
+      description: |
+        A hold restrains retention destruction for every record in its scope
+        while active; it never freezes writes. `effectiveFrom` may be
+        backdated — FRCP 37(e)'s preservation duty attaches on anticipation
+        of litigation, judged after the fact — and gates only when the hold
+        is active, never which records it protects. `placedBy` is stamped
+        from the token; `placedAt` by the store. Holds are not upsertable:
+        a duplicate ID is 409 `hold_exists`.
+      operationId: placeHold
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PlaceHoldRequest' }
+      responses:
+        '201':
+          description: The hold as stored.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Hold' }
+        '400': { $ref: '#/components/responses/badRequest' }
+        '401': { $ref: '#/components/responses/unauthorized' }
+        '403': { $ref: '#/components/responses/forbidden' }
+        '409':
+          description: A hold with this ID already exists (`hold_exists`).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+    get:
+      tags: [holds]
+      summary: List every hold ever recorded (admin)
+      description: Released holds included, in placement order — the whole lifecycle is the audit value.
+      operationId: listHolds
+      responses:
+        '200':
+          description: All holds.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [holds]
+                properties:
+                  holds:
+                    type: array
+                    items: { $ref: '#/components/schemas/Hold' }
+        '401': { $ref: '#/components/responses/unauthorized' }
+        '403': { $ref: '#/components/responses/forbidden' }
+
+  /v1/holds/{id}/release:
+    post:
+      tags: [holds]
+      summary: Release a legal hold (admin)
+      description: |
+        The hold row survives with its release half filled in — who released
+        it, when, and why. Releasing an already-released hold is 409
+        `hold_released`, because a second release would rewrite the first
+        one's attribution. `releasedBy` is stamped from the token.
+      operationId: releaseHold
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                reason: { type: string, description: Optional free-text justification. }
+      responses:
+        '200':
+          description: The hold as stored, released.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Hold' }
+        '400': { $ref: '#/components/responses/badRequest' }
+        '401': { $ref: '#/components/responses/unauthorized' }
+        '403': { $ref: '#/components/responses/forbidden' }
+        '404':
+          description: No such hold (`not_found`).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '409':
+          description: Already released (`hold_released`).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /v1/retention/sweep:
+    post:
+      tags: [retention]
+      summary: Run a retention sweep (admin)
+      description: |
+        Destroys superseded records older than their kind's policy allows,
+        except those an active legal hold matches — hold always beats
+        retention. Eligibility is measured from the instant a record was
+        superseded, and a current record is never eligible at any age. With
+        `dryRun` the same decision logic runs and nothing is destroyed; run
+        that first. An empty policy list is refused (`no_policy`): there is
+        no default retention period on purpose. Under chaining, destroyed
+        chained records leave tombstones so verification crosses the gap.
+      operationId: retentionSweep
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SweepRequest' }
+      responses:
+        '200':
+          description: What the sweep did — or, for a dry run, exactly what it would do.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SweepReport' }
+        '400': { $ref: '#/components/responses/badRequest' }
+        '401': { $ref: '#/components/responses/unauthorized' }
+        '403': { $ref: '#/components/responses/forbidden' }
+
+  /v1/{kind}/{entity}/verify:
+    get:
+      tags: [tamper-evidence]
+      summary: Verify an entity's hash chain (admin)
+      description: |
+        Recomputes the chain and reports the first divergence, if any. A
+        divergence is reported in the body, not as an error status; a 404
+        `no_chain` means there is nothing to verify, which must never be
+        mistaken for a verification that passed. Honest threat model: a
+        chain detects retrospective edits by someone who does not control
+        the chain head, and nothing against an administrator who can
+        recompute every hash — only externally anchored heads change that.
+      operationId: verifyChain
+      parameters:
+        - $ref: '#/components/parameters/kind'
+        - $ref: '#/components/parameters/entity'
+      responses:
+        '200':
+          description: The verification report.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/VerifyReport' }
+        '401': { $ref: '#/components/responses/unauthorized' }
+        '403': { $ref: '#/components/responses/forbidden' }
+        '404':
+          description: The entity has no chained records (`no_chain`).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /v1/{kind}/{entity}/chain-head:
+    get:
+      tags: [tamper-evidence]
+      summary: Read an entity's chain head for external anchoring (admin)
+      description: |
+        The stored head, unverified — anchoring and verification are separate
+        acts. Lodge the value somewhere the database administrator cannot
+        reach (a ledger, a timestamping service, another trust domain);
+        chronicled ships no anchoring and claims nothing anchoring would be
+        needed for.
+      operationId: chainHead
+      parameters:
+        - $ref: '#/components/parameters/kind'
+        - $ref: '#/components/parameters/entity'
+      responses:
+        '200':
+          description: The chain head.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [kind, entityId, head]
+                properties:
+                  kind: { type: string }
+                  entityId: { type: string }
+                  head: { type: string, description: Hex-encoded chain head. }
+        '401': { $ref: '#/components/responses/unauthorized' }
+        '403': { $ref: '#/components/responses/forbidden' }
+        '404':
+          description: The entity has no chained records (`no_chain`).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /v1/subjects/{subject}/destroy-key:
+    post:
+      tags: [erasure]
+      summary: Destroy a subject's encryption key (admin)
+      description: |
+        Renders every value written with this subject unrecoverable while
+        preserving the records' structure. Terminal and idempotent: no key
+        can ever be minted for the subject again. Whether key destruction
+        constitutes erasure under GDPR Art. 17 depends on your supervisory
+        authority's position; chronicle makes no compliance claim. Note that
+        the default deployment keeps keys in the same database — and the
+        same backups — as the records; back the service with a KMS-based
+        keyring where shredding must withstand backup retention.
+      operationId: destroyKey
+      parameters:
+        - { name: subject, in: path, required: true, schema: { type: string } }
+      responses:
+        '200':
+          description: The key is destroyed (or already was).
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [subject, destroyed, note]
+                properties:
+                  subject: { type: string }
+                  destroyed: { type: boolean }
+                  note: { type: string }
+        '401': { $ref: '#/components/responses/unauthorized' }
+        '403': { $ref: '#/components/responses/forbidden' }
+
+  /v1/openapi.yaml:
+    get:
+      tags: [system]
+      summary: This document
+      operationId: getOpenAPI
+      responses:
+        '200':
+          description: The OpenAPI description of this service.
+          content:
+            application/yaml:
+              schema: { type: string }
+        '401': { $ref: '#/components/responses/unauthorized' }
+
+  /healthz:
+    get:
+      tags: [system]
+      summary: Liveness
+      description: The process is up. No authentication — probes carry no tokens — and no information beyond that.
+      operationId: healthz
+      security: []
+      responses:
+        '200':
+          description: Alive.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, enum: [ok] }
+
+  /readyz:
+    get:
+      tags: [system]
+      summary: Readiness
+      description: The database answers a ping. No authentication.
+      operationId: readyz
+      security: []
+      responses:
+        '200':
+          description: Ready.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, enum: [ok] }
+        '503':
+          description: Database unreachable (`unavailable`).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+components:
+  securitySchemes:
+    bearer:
+      type: http
+      scheme: bearer
+      description: |
+        Static token from the service's configured table. Each token maps to
+        the actor it writes as and a role: `writer` (write + read) or
+        `admin` (also holds, retention, shredding, verification).
+
+  parameters:
+    kind:
+      name: kind
+      in: path
+      required: true
+      schema: { type: string }
+      description: Entity type discriminator.
+    entity:
+      name: entity
+      in: path
+      required: true
+      schema: { type: string }
+      description: The caller's opaque entity identifier, scoped by kind.
+
+  requestBodies:
+    write:
+      required: true
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/WriteRequest' }
+
+  responses:
+    badRequest:
+      description: |
+        Malformed request. Notable codes: `invalid_body`, `invalid_argument`,
+        `invalid_interval`, `invalid_cursor`, `unknown_intent`,
+        `reserved_meta`, `invalid_meta`, `invalid_field`, and the two
+        explanatory rejections — `actor_forbidden` (an actor field in a
+        request body) and `tx_forbidden` (a transaction-time field in a
+        request body).
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    unauthorized:
+      description: Missing or unknown bearer token (`unauthorized`).
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    forbidden:
+      description: The token's role does not allow this endpoint (`forbidden`).
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    conflict:
+      description: The write lost a concurrent race and exhausted its retries (`conflict`).
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+
+  schemas:
+    Error:
+      type: object
+      required: [error, code]
+      properties:
+        error:
+          type: string
+          description: Human-readable message. Do not switch on it.
+        code:
+          type: string
+          description: |
+            Stable machine-readable code mirroring chronicle's error
+            taxonomy. Values include not_found, no_chain, invalid_interval,
+            invalid_cursor, unknown_kind, unknown_intent, invalid_meta,
+            invalid_field, missing_entity_id, reserved_meta, missing_hold_id,
+            hold_exists, hold_released, conflict, current_record, shredded,
+            key_destroyed, codec, no_policy, invalid_policy, no_keyring,
+            unsupported, unavailable, unauthorized, forbidden,
+            actor_forbidden, tx_forbidden, invalid_body, invalid_argument,
+            body_too_large, method_not_allowed, internal.
+        detail:
+          description: Optional structured context, such as the resolved lookup coordinates on a not_found.
+
+    WriteRequest:
+      type: object
+      required: [data, validFrom]
+      properties:
+        data:
+          description: The entity's state, as any JSON value. Stored compacted; records carry their own shape.
+        validFrom:
+          type: string
+          format: date-time
+          description: Inclusive start of the valid interval. Required.
+        validTo:
+          type: string
+          format: date-time
+          nullable: true
+          description: Exclusive end of the valid interval. Absent or null = unbounded ("and it still holds").
+        reason:
+          type: string
+          description: Optional free-text business justification. Optional by design; see docs/COMPLIANCE.md.
+        meta:
+          type: object
+          additionalProperties: { type: string }
+          description: Caller metadata. Keys under the "chronicle:" prefix are reserved and rejected.
+        subject:
+          type: string
+          description: |
+            Optional crypto-shredding subject. The record's data is encrypted
+            under this subject's key; destroying the key later renders it
+            unrecoverable. Use a pseudonymous reference — the subject string
+            is stored in clear and survives shredding.
+      description: |
+        There is deliberately no actor field (the token supplies the actor;
+        sending one is 400 `actor_forbidden`) and no transaction-time field
+        (the server assigns it; sending one is 400 `tx_forbidden`). Unknown
+        fields are rejected.
+
+    Actor:
+      type: object
+      required: [id]
+      properties:
+        id: { type: string }
+        type: { type: string }
+        name: { type: string }
+
+    Record:
+      type: object
+      required: [id, kind, entityId, txFrom, actor, intent]
+      properties:
+        id: { type: string, description: Opaque, chronicle-assigned. }
+        kind: { type: string }
+        entityId: { type: string }
+        data:
+          description: The state as stored, when it is valid JSON (the usual case).
+        dataBase64:
+          type: string
+          description: The state as stored when it is not valid JSON — in practice, ciphertext for a subject-encrypted record.
+        validFrom: { type: string, format: date-time, description: Absent = the fact was always true. }
+        validTo: { type: string, format: date-time, description: Absent = the fact still holds. }
+        txFrom: { type: string, format: date-time, description: When the service learned the fact. Server-assigned. }
+        txTo: { type: string, format: date-time, description: When this belief was superseded. Absent = current belief. }
+        actor: { $ref: '#/components/schemas/Actor' }
+        reason: { type: string }
+        intent:
+          type: string
+          enum: [assert, correction, remainder]
+          description: remainder marks a record the service wrote itself to preserve the uncovered part of a superseded interval.
+        meta:
+          type: object
+          additionalProperties: { type: string }
+          description: Includes reserved "chronicle:" keys the service writes itself (chain hash, encryption markers).
+
+    Result:
+      type: object
+      required: [txAt, record, written, superseded]
+      properties:
+        txAt: { type: string, format: date-time, description: The transaction instant assigned to the whole write. }
+        record: { $ref: '#/components/schemas/Record' }
+        written:
+          type: array
+          items: { $ref: '#/components/schemas/Record' }
+          description: Everything inserted — the caller's record first, then remainders.
+        superseded:
+          type: array
+          items: { type: string }
+          description: IDs of records whose transaction interval this write closed.
+
+    Records:
+      type: object
+      required: [records]
+      properties:
+        records:
+          type: array
+          items: { $ref: '#/components/schemas/Record' }
+        cursor:
+          type: string
+          description: Present only when records were withheld; pass back as ?cursor= to resume. Absent = last page.
+
+    As:
+      type: object
+      properties:
+        validAt: { type: string, format: date-time }
+        txAt: { type: string, format: date-time }
+
+    Change:
+      type: object
+      required: [path, op, old, new]
+      properties:
+        path: { type: string, description: RFC 6901 JSON Pointer ("/salary", "/address/city"). }
+        op: { type: string, enum: [modified, added, removed] }
+        old: { description: Value on the earlier side; null for an addition. }
+        new: { description: Value on the later side; null for a removal. }
+
+    Delta:
+      type: object
+      required: [kind, entityId, from, to, fromRecord, toRecord, changes]
+      properties:
+        kind: { type: string }
+        entityId: { type: string }
+        from: { $ref: '#/components/schemas/As', description: As resolved — absent instants replaced with the instants actually used. }
+        to: { $ref: '#/components/schemas/As' }
+        fromRecord:
+          nullable: true
+          allOf: [{ $ref: '#/components/schemas/Record' }]
+        toRecord:
+          nullable: true
+          allOf: [{ $ref: '#/components/schemas/Record' }]
+        changes:
+          type: array
+          items: { $ref: '#/components/schemas/Change' }
+
+    PlaceHoldRequest:
+      type: object
+      required: [id]
+      properties:
+        id: { type: string, description: Caller-supplied, typically a matter or case reference. Unique. }
+        kind: { type: string, description: Scope to one kind. Empty = every kind. }
+        entityId: { type: string, description: Scope to one entity ID. With kind empty, matches the ID across all kinds. }
+        effectiveFrom:
+          type: string
+          format: date-time
+          description: Operator-asserted instant the preservation duty attached. May be backdated. Absent = effective over all time until released.
+        reason: { type: string }
+      description: placedBy is stamped from the token and placedAt by the store; sending either is a 400.
+
+    Hold:
+      type: object
+      required: [id, placedBy, placedAt]
+      properties:
+        id: { type: string }
+        kind: { type: string }
+        entityId: { type: string }
+        effectiveFrom: { type: string, format: date-time }
+        reason: { type: string }
+        placedBy: { $ref: '#/components/schemas/Actor' }
+        placedAt: { type: string, format: date-time, description: Store-assigned. }
+        releasedAt: { type: string, format: date-time, description: Absent = still in force. }
+        releasedBy: { $ref: '#/components/schemas/Actor' }
+        releaseReason: { type: string }
+
+    SweepRequest:
+      type: object
+      required: [policies]
+      properties:
+        policies:
+          type: array
+          items:
+            type: object
+            required: [kind, keepFor]
+            properties:
+              kind: { type: string }
+              keepFor: { type: string, description: Go duration string, e.g. "8760h". Must be positive. }
+        dryRun: { type: boolean, description: Plan without destroying. Run this first. }
+
+    SweepReport:
+      type: object
+      required: [now, executed, kinds]
+      properties:
+        now: { type: string, format: date-time, description: The instant cutoffs were computed from. }
+        executed: { type: boolean, description: False for a dry run — nothing was destroyed. }
+        kinds:
+          type: array
+          items:
+            type: object
+            required: [kind, cutoff, examined, deleted, tombstones, withheld]
+            properties:
+              kind: { type: string }
+              cutoff: { type: string, format: date-time, description: Records superseded at or before this instant were eligible. }
+              examined: { type: integer }
+              deleted: { type: integer, description: Destroyed — or, for a dry run, would have been. }
+              tombstones: { type: integer, description: How many of those carry a chain hash and leave tombstones. }
+              withheld:
+                type: array
+                description: Every eligible record an active hold saved, and the hold that saved it — evidence of the control working.
+                items:
+                  type: object
+                  required: [recordId, holdId]
+                  properties:
+                    recordId: { type: string }
+                    holdId: { type: string }
+
+    VerifyReport:
+      type: object
+      required: [kind, entityId, intact, chainedRecords, tombstones, unchainedPrefix]
+      properties:
+        kind: { type: string }
+        entityId: { type: string }
+        intact: { type: boolean }
+        chainedRecords: { type: integer, description: Surviving records the chain vouches for. }
+        tombstones: { type: integer, description: Destroyed records passed over on their retained hashes. }
+        unchainedPrefix: { type: integer, description: Records written before chaining began — outside the chain's protection, counted so the report never understates what it did not check. }
+        head: { type: string, description: Hex-encoded chain head; present only when the chain is intact. }
+        divergence:
+          type: object
+          description: First point at which the chain stopped adding up; absent when intact.
+          required: [recordId, position, reason]
+          properties:
+            recordId: { type: string }
+            position: { type: integer }
+            reason: { type: string }
