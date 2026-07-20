@@ -189,6 +189,7 @@ func TestOpenAPI(t *testing.T) {
 		"/v1/{kind}/{entity}/history:",
 		"/v1/{kind}/{entity}/timeline:",
 		"/v1/{kind}/{entity}/diff:",
+		"/v1/{kind}/{entity}/field-history:",
 		"/v1/{kind}/{entity}/verify:",
 		"/v1/{kind}/{entity}/chain-head:",
 		"/v1/records:",

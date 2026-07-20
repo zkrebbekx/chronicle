@@ -247,6 +247,58 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
 
+  /v1/{kind}/{entity}/field-history:
+    get:
+      tags: [records]
+      summary: Single-field audit trail over transaction time (FieldHistory)
+      description: |
+        Walks how the recorded value of one field of the entity changed over
+        **transaction** time, holding a point in **valid** time fixed. For the
+        entity's state as valid at `validAt` (absent = now), each returned
+        change is a point where the field's value differed from the previous
+        belief — who changed it (`actor`), when we learned it (`txAt`), and
+        whether it was an assertion or a correction (`intent`). This is the
+        bitemporal read a field-level audit trail is: a walk along the
+        transaction axis at a fixed valid point, not along valid time.
+
+        `path` is a required RFC 6901 JSON Pointer, the same grammar Diff
+        emits — URL-encode the slashes (`%2Fsalary`). A malformed pointer is
+        400 `invalid_path`; a well-formed pointer that no record contains is
+        an empty `changes` list, not an error. Each side of a change carries a
+        `present` flag, so a field absent from the object is kept distinct from
+        one explicitly set to JSON null. Numbers compare by value, not
+        notation, so re-recording 100 as 100.0 is not a change. A record that
+        exists but cannot be decoded is 422 `codec`, never a silent gap.
+      operationId: getFieldHistory
+      parameters:
+        - $ref: '#/components/parameters/kind'
+        - $ref: '#/components/parameters/entity'
+        - { name: path, in: query, required: true, schema: { type: string }, description: 'RFC 6901 JSON Pointer, e.g. /salary. URL-encode the slashes.' }
+        - { name: validAt, in: query, schema: { type: string, format: date-time }, description: Point in valid time; absent = now. }
+        - { name: descending, in: query, schema: { type: boolean }, description: Most recently recorded change first; default ascending. }
+      responses:
+        '200':
+          description: The field's revisions over transaction time.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/FieldHistory' }
+        '400':
+          description: The path is missing, or is not a well-formed pointer (`invalid_argument`, `invalid_path`).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401': { $ref: '#/components/responses/unauthorized' }
+        '410':
+          description: A belief in the walk was encrypted for a subject whose key has been destroyed (`shredded`).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '422':
+          description: A record exists but its data could not be decoded (`codec`).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
   /v1/records:
     get:
       tags: [query]
@@ -767,6 +819,42 @@ components:
         changes:
           type: array
           items: { $ref: '#/components/schemas/Change' }
+
+    FieldValue:
+      type: object
+      required: [present]
+      description: |
+        One side of a field revision. `present` is false when the field was
+        absent from the object, and true when it was there; a present field
+        with `value` null was explicitly set to JSON null, which is a different
+        fact from being absent.
+      properties:
+        present: { type: boolean }
+        value: { description: The field's raw JSON value; omitted when the field was absent. }
+
+    FieldRevision:
+      type: object
+      required: [path, from, to, txAt, actor, intent]
+      properties:
+        path: { type: string, description: RFC 6901 JSON Pointer the history was taken for. }
+        from: { $ref: '#/components/schemas/FieldValue', description: The value in the belief before this one. }
+        to: { $ref: '#/components/schemas/FieldValue', description: The value this belief recorded. }
+        txAt: { type: string, format: date-time, description: When we came to believe this — the introducing record's TxFrom. }
+        validFrom: { type: string, format: date-time, description: Valid interval of the introducing record; omitted when unbounded. }
+        validTo: { type: string, format: date-time }
+        actor: { $ref: '#/components/schemas/Actor' }
+        reason: { type: string }
+        intent: { type: string, enum: [assert, correction, remainder] }
+
+    FieldHistory:
+      type: object
+      required: [path, changes]
+      properties:
+        path: { type: string }
+        validAt: { type: string, format: date-time, description: The valid point the history was taken at; omitted when it defaulted to now. }
+        changes:
+          type: array
+          items: { $ref: '#/components/schemas/FieldRevision' }
 
     PlaceHoldRequest:
       type: object

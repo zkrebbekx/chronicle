@@ -176,6 +176,70 @@ func toDeltaDTO(d chronicle.Delta) deltaDTO {
 	return dto
 }
 
+// fieldValueDTO renders one side of a field revision. Present distinguishes an
+// absent field from one explicitly set to JSON null, exactly as the library's
+// FieldValue does: when Present is false the field was not in the object and
+// Value is omitted; when Present is true Value carries the raw JSON, which is
+// the literal null for an explicit null.
+type fieldValueDTO struct {
+	Present bool            `json:"present"`
+	Value   json.RawMessage `json:"value,omitempty"`
+}
+
+func toFieldValueDTO(v chronicle.FieldValue) fieldValueDTO {
+	dto := fieldValueDTO{Present: v.Present}
+	if v.Present {
+		// The value came from decoding a stored record, so re-marshalling it
+		// cannot fail; a present field always renders its value, null included.
+		if raw, err := json.Marshal(v.Value); err == nil {
+			dto.Value = raw
+		}
+	}
+	return dto
+}
+
+type fieldRevisionDTO struct {
+	Path      string        `json:"path"`
+	From      fieldValueDTO `json:"from"`
+	To        fieldValueDTO `json:"to"`
+	TxAt      string        `json:"txAt"`
+	ValidFrom string        `json:"validFrom,omitempty"`
+	ValidTo   string        `json:"validTo,omitempty"`
+	Actor     actorDTO      `json:"actor"`
+	Reason    string        `json:"reason,omitempty"`
+	Intent    string        `json:"intent"`
+}
+
+type fieldHistoryResponse struct {
+	Path string `json:"path"`
+	// ValidAt is the point in valid time the history was taken at, echoed back.
+	// Absent (omitted) means the caller did not pin one, so it defaulted to now.
+	ValidAt string             `json:"validAt,omitempty"`
+	Changes []fieldRevisionDTO `json:"changes"`
+}
+
+func toFieldHistoryResponse(path string, validAt time.Time, revs []chronicle.FieldRevision) fieldHistoryResponse {
+	out := fieldHistoryResponse{
+		Path:    path,
+		ValidAt: fmtTime(validAt),
+		Changes: make([]fieldRevisionDTO, 0, len(revs)),
+	}
+	for _, r := range revs {
+		out.Changes = append(out.Changes, fieldRevisionDTO{
+			Path:      r.Path,
+			From:      toFieldValueDTO(r.From),
+			To:        toFieldValueDTO(r.To),
+			TxAt:      fmtTime(r.TxAt),
+			ValidFrom: fmtTime(r.ValidFrom),
+			ValidTo:   fmtTime(r.ValidTo),
+			Actor:     toActorDTO(r.Actor),
+			Reason:    r.Reason,
+			Intent:    r.Intent.String(),
+		})
+	}
+	return out
+}
+
 type holdDTO struct {
 	ID            string    `json:"id"`
 	Kind          string    `json:"kind,omitempty"`

@@ -81,6 +81,7 @@ func NewHandler(d Deps) http.Handler {
 	api.HandleFunc("GET /v1/{kind}/{entity}/history", s.handleHistory)
 	api.HandleFunc("GET /v1/{kind}/{entity}/timeline", s.handleTimeline)
 	api.HandleFunc("GET /v1/{kind}/{entity}/diff", s.handleDiff)
+	api.HandleFunc("GET /v1/{kind}/{entity}/field-history", s.handleFieldHistory)
 	api.HandleFunc("GET /v1/{kind}/{entity}/verify", s.admin(s.handleVerify))
 	api.HandleFunc("GET /v1/{kind}/{entity}/chain-head", s.admin(s.handleChainHead))
 	api.HandleFunc("GET /v1/records", s.handleQuery)

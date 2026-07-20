@@ -133,6 +133,60 @@ func TestPGBitemporalFlagship(t *testing.T) {
 	}
 }
 
+// TestPGFieldHistoryFlagship is the single-field audit trail end to end over
+// the real store: a salary asserted, then retroactively corrected, then walked
+// on the transaction axis at a fixed valid point. Two changes come back, the
+// assertion and the correction, each attributed and stamped from the database
+// clock.
+func TestPGFieldHistoryFlagship(t *testing.T) {
+	h := pgHarness(t, false)
+
+	resp, body := doRequest(t, h.srv, "POST", "/v1/employee/frank/records", writerToken,
+		putBody(`{"salary":50000,"title":"Engineer"}`, "2026-03-01T00:00:00Z"))
+	wantStatus(t, resp, body, http.StatusCreated)
+	var put resultDTO
+	decode(t, body, &put)
+
+	resp, body = doRequest(t, h.srv, "POST", "/v1/employee/frank/corrections", adminToken,
+		putBody(`{"salary":55000,"title":"Engineer"}`, "2026-03-01T00:00:00Z"))
+	wantStatus(t, resp, body, http.StatusCreated)
+	var corr resultDTO
+	decode(t, body, &corr)
+
+	march := "2026-03-15T00:00:00Z"
+	resp, body = doRequest(t, h.srv, "GET",
+		"/v1/employee/frank/field-history?path="+url.QueryEscape("/salary")+"&validAt="+march,
+		writerToken, nil)
+	wantStatus(t, resp, body, http.StatusOK)
+	var fh fieldHistoryResponse
+	decode(t, body, &fh)
+
+	if len(fh.Changes) != 2 {
+		t.Fatalf("changes = %d, want 2: %s", len(fh.Changes), body)
+	}
+	if fh.Changes[0].From.Present || string(fh.Changes[0].To.Value) != "50000" ||
+		fh.Changes[0].Intent != "assert" || fh.Changes[0].Actor.ID != writerActor.ID ||
+		fh.Changes[0].TxAt != put.TxAt {
+		t.Fatalf("first change = %+v, want absent -> 50000 asserted by the writer at %s", fh.Changes[0], put.TxAt)
+	}
+	if string(fh.Changes[1].From.Value) != "50000" || string(fh.Changes[1].To.Value) != "55000" ||
+		fh.Changes[1].Intent != "correction" || fh.Changes[1].Actor.ID != adminActor.ID ||
+		fh.Changes[1].TxAt != corr.TxAt {
+		t.Fatalf("second change = %+v, want 50000 -> 55000 corrected by the admin at %s", fh.Changes[1], corr.TxAt)
+	}
+
+	// The title never changed, so its history is a single appearance — the field
+	// isolation the whole feature promises, proven on the real store.
+	resp, body = doRequest(t, h.srv, "GET",
+		"/v1/employee/frank/field-history?path="+url.QueryEscape("/title")+"&validAt="+march,
+		writerToken, nil)
+	wantStatus(t, resp, body, http.StatusOK)
+	decode(t, body, &fh)
+	if len(fh.Changes) != 1 {
+		t.Fatalf("title changes = %d, want 1 — the title never changed", len(fh.Changes))
+	}
+}
+
 // TestPGCursorPassThrough: the HTTP pagination walk equals the library walk
 // with keyset pagination pushed down into SQL.
 func TestPGCursorPassThrough(t *testing.T) {

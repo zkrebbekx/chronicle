@@ -58,6 +58,7 @@ var errorTable = []mapping{
 	{chronicle.ErrNoChain, http.StatusNotFound, "no_chain"},
 	{chronicle.ErrInvalidInterval, http.StatusBadRequest, "invalid_interval"},
 	{chronicle.ErrInvalidCursor, http.StatusBadRequest, "invalid_cursor"},
+	{chronicle.ErrInvalidPath, http.StatusBadRequest, "invalid_path"},
 	{chronicle.ErrUnknownKind, http.StatusBadRequest, "unknown_kind"},
 	{chronicle.ErrUnknownIntent, http.StatusBadRequest, "unknown_intent"},
 	{chronicle.ErrInvalidMeta, http.StatusBadRequest, "invalid_meta"},

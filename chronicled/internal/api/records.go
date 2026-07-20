@@ -393,6 +393,58 @@ func (s *Server) handleDiff(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, toDeltaDTO(delta))
 }
 
+// handleFieldHistory is GET /v1/{kind}/{entity}/field-history?path=&validAt=&descending=:
+// the single-field audit trail. It walks how the recorded value of one field
+// changed over transaction time, holding the valid point fixed — who changed
+// it, when we learned it, and whether it was an assertion or a correction.
+//
+// path is required and is an RFC 6901 JSON Pointer (URL-encode the slashes).
+// validAt is optional and, absent, means now — this is a point in valid time,
+// like Get and Diff, not the "no restriction" a cross-entity query would read
+// an absent instant as.
+func (s *Server) handleFieldHistory(w http.ResponseWriter, r *http.Request) {
+	kind, entity, ok := s.pathKindEntity(w, r)
+	if !ok {
+		return
+	}
+	q := r.URL.Query()
+	// path is required. It is URL-decoded by Query() already; reject a NUL like
+	// every other caller-supplied string, so a malformed pointer is the
+	// library's 400 and a NUL is this layer's, never a driver 500.
+	path := q.Get("path")
+	if path == "" {
+		s.respondError(w, r, badRequest("invalid_argument",
+			"path is required: an RFC 6901 JSON Pointer such as /salary or /address/city (URL-encode the slashes)"))
+		return
+	}
+	if err := rejectNUL("path", path); err != nil {
+		s.respondError(w, r, err)
+		return
+	}
+	validAt, err := queryTime(q, "validAt")
+	if err != nil {
+		s.respondError(w, r, err)
+		return
+	}
+	descending, err := queryBool(q, "descending")
+	if err != nil {
+		s.respondError(w, r, err)
+		return
+	}
+	var opts []chronicle.FieldHistoryOption
+	if descending {
+		opts = append(opts, chronicle.FieldHistoryDescending())
+	}
+
+	revs, err := s.log.FieldHistory(r.Context(), kind, entity, path,
+		chronicle.As{ValidAt: validAt}, opts...)
+	if err != nil {
+		s.respondError(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, toFieldHistoryResponse(path, validAt, revs))
+}
+
 const (
 	defaultQueryLimit = 100
 	maxQueryLimit     = 1000
