@@ -44,10 +44,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # pgstore requires go 1.24: its test-only driver dependencies (pgx
-        # v5.8+) set that floor, and go 1.23 is past upstream EOL. The root
-        # module is zero-dependency and keeps 1.23.
-        go: ["1.24", "1.25"]
+        # pgstore requires go 1.25: its test-only driver dependency (pgx v5.9+,
+        # pinned for a memory-safety and a SQL-injection fix) sets that floor.
+        # The root module is zero-dependency and keeps its 1.23..1.25 range.
+        go: ["1.25"]
     services:
       postgres:
         image: postgres:17-alpine
@@ -115,14 +115,15 @@ jobs:
         run: go test -race -timeout 60s ./...
 
   # chronicled shares pgstore's shape: it needs Postgres for its integration
-  # suite, skips it cleanly without one, and sets the same go 1.24 floor.
+  # suite, skips it cleanly without one, and inherits the same go 1.25 floor
+  # through its pgx dependency.
   chronicled:
     name: test (chronicled, go ${{ matrix.go }})
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        go: ["1.24", "1.25"]
+        go: ["1.25"]
     services:
       postgres:
         image: postgres:17-alpine
@@ -195,7 +196,9 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
         with:
-          go-version: "1.24"
+          # 1.25 so the linter can load pgstore and chronicled, whose pgx
+          # dependency sets a 1.25 floor; the root module (1.23) loads fine too.
+          go-version: "1.25"
           cache: true
       - name: golangci-lint
         uses: golangci/golangci-lint-action@82606bf257cbaff209d206a39f5134f0cfbfd2ee # v9

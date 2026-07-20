@@ -84,10 +84,19 @@ func parseTime(field, value string) (time.Time, error) {
 		return time.Time{}, badRequest("invalid_argument",
 			fmt.Sprintf("%s is chronicle's unbounded sentinel (%s); omit the field to mean unbounded or now", field, value))
 	}
-	// The store holds microseconds. Truncate here so the value the caller sees
-	// echoed in a 201 response is byte-identical to what a later read returns,
-	// rather than the nanosecond input the store never actually stored.
-	return t.UTC().Truncate(time.Microsecond), nil
+	return t.UTC(), nil
+}
+
+// storeGrain truncates a caller-supplied valid time to the store's microsecond
+// resolution, so the value echoed in a write response is byte-identical to what
+// a later read returns rather than the nanosecond input the store never held.
+//
+// This is applied only to the valid times a write records, never to a query
+// instant: transaction time is assigned full-resolution by an in-memory store,
+// and truncating a query's txAt downward would step it before the record's own
+// TxFrom and miss it. Query points are matched as given.
+func storeGrain(t time.Time) time.Time {
+	return t.Truncate(time.Microsecond)
 }
 
 // queryTime parses an optional RFC 3339 query parameter; absent means zero.
@@ -174,6 +183,7 @@ func (s *Server) handleWrite(w http.ResponseWriter, r *http.Request, correct boo
 		s.respondError(w, r, err)
 		return
 	}
+	validFrom = storeGrain(validFrom)
 	var validTo time.Time // zero = unbounded ("and it still holds")
 	if req.ValidTo != nil {
 		validTo, err = parseTime("validTo", *req.ValidTo)
@@ -181,6 +191,7 @@ func (s *Server) handleWrite(w http.ResponseWriter, r *http.Request, correct boo
 			s.respondError(w, r, err)
 			return
 		}
+		validTo = storeGrain(validTo)
 	}
 
 	// Compact the data so equivalent submissions store identical bytes; the
