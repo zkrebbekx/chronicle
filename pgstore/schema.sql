@@ -104,3 +104,50 @@ CREATE INDEX IF NOT EXISTS $NAME$_valid_gist
 
 CREATE INDEX IF NOT EXISTS $NAME$_tx_gist
     ON $TABLE$ USING gist (tx);
+
+-- Legal holds. One row per hold, forever: placement writes the left half,
+-- release fills the right half, and nothing deletes a row -- the lifecycle of
+-- the control is itself an audit record. placed_at and released_at are
+-- assigned by the store; effective_from is the operator's assertion of when
+-- the preservation duty attached and may legitimately be backdated (FRCP
+-- 37(e) triggers on anticipation, judged after the fact). NULL effective_from
+-- means the duty has no asserted start.
+CREATE TABLE IF NOT EXISTS $HOLDS$ (
+    id               text PRIMARY KEY,
+    kind             text NOT NULL DEFAULT '',
+    entity_id        text NOT NULL DEFAULT '',
+    effective_from   timestamptz,
+    reason           text NOT NULL DEFAULT '',
+    placed_by_id     text NOT NULL,
+    placed_by_type   text NOT NULL DEFAULT '',
+    placed_by_name   text NOT NULL DEFAULT '',
+    placed_at        timestamptz NOT NULL,
+    released_at      timestamptz,
+    released_by_id   text NOT NULL DEFAULT '',
+    released_by_type text NOT NULL DEFAULT '',
+    released_by_name text NOT NULL DEFAULT '',
+    release_reason   text NOT NULL DEFAULT '',
+
+    CONSTRAINT $NAME$_h_placed CHECK (placed_by_id <> ''),
+    -- A release without an actor is not a release chronicle performed.
+    CONSTRAINT $NAME$_h_attributed CHECK (released_at IS NULL OR released_by_id <> '')
+);
+
+-- Tombstones: what remains of a chained record after retention destroyed it.
+-- The chain hash is kept verbatim, format prefix included, so Verify can pass
+-- over the gap; the coordinates are kept so the tombstone sorts where the
+-- record used to. Deletion and tombstone insertion happen in one transaction,
+-- and record_id as the key makes a retried deletion write the same tombstone
+-- once.
+CREATE TABLE IF NOT EXISTS $TOMBS$ (
+    record_id  text COLLATE "C" PRIMARY KEY,
+    kind       text NOT NULL,
+    entity_id  text NOT NULL,
+    valid_from timestamptz,
+    tx_from    timestamptz NOT NULL,
+    chain_hash text NOT NULL,
+    deleted_at timestamptz NOT NULL DEFAULT clock_timestamp()
+);
+
+CREATE INDEX IF NOT EXISTS $NAME$_t_entity
+    ON $TOMBS$ (kind, entity_id, tx_from, COALESCE(valid_from, '-infinity'::timestamptz), record_id);

@@ -80,6 +80,9 @@ type Store struct {
 	// qualified is the quoted, optionally schema-qualified table name, safe to
 	// interpolate into SQL.
 	qualified string
+	// holds and tombs are the quoted, qualified names of the legal-hold and
+	// tombstone tables, derived from the record table's name.
+	holds, tombs string
 }
 
 // Option configures a [Store].
@@ -122,17 +125,53 @@ func New(db *sql.DB, opts ...Option) (*Store, error) {
 	for _, opt := range opts {
 		opt(&cfg)
 	}
-	if err := validIdentifier("table", cfg.table); err != nil {
+	if err := validTableName(cfg.table); err != nil {
 		return nil, err
 	}
-	qualified := quote(cfg.table)
 	if cfg.schema != "" {
 		if err := validIdentifier("schema", cfg.schema); err != nil {
 			return nil, err
 		}
-		qualified = quote(cfg.schema) + "." + quote(cfg.table)
 	}
-	return &Store{db: db, schema: cfg.schema, table: cfg.table, qualified: qualified}, nil
+	return &Store{
+		db:        db,
+		schema:    cfg.schema,
+		table:     cfg.table,
+		qualified: qualify(cfg.schema, cfg.table),
+		holds:     qualify(cfg.schema, cfg.table+holdsSuffix),
+		tombs:     qualify(cfg.schema, cfg.table+tombsSuffix),
+	}, nil
+}
+
+// holdsSuffix and tombsSuffix derive the auxiliary table names from the
+// record table's, so two stores in one schema keep their compliance tables
+// apart the same way they keep their record tables apart.
+const (
+	holdsSuffix = "_holds"
+	tombsSuffix = "_tombstones"
+)
+
+// validTableName is [validIdentifier] plus the room the derived table names
+// need. Postgres silently truncates identifiers beyond 63 bytes, and a
+// truncated "_tombstones" suffix would collide with the record table itself —
+// a failure mode far worse than an early error.
+func validTableName(table string) error {
+	if err := validIdentifier("table", table); err != nil {
+		return err
+	}
+	if len(table)+len(tombsSuffix) > 63 {
+		return fmt.Errorf("pgstore: table name %q is too long to derive %q and %q from within "+
+			"Postgres's 63-byte identifier limit", table, table+holdsSuffix, table+tombsSuffix)
+	}
+	return nil
+}
+
+// qualify renders a quoted, optionally schema-qualified name.
+func qualify(schema, name string) string {
+	if schema == "" {
+		return quote(name)
+	}
+	return quote(schema) + "." + quote(name)
 }
 
 // Table returns the quoted, schema-qualified table name the store reads and
@@ -171,17 +210,17 @@ func SchemaSQL(schema, table string) (string, error) {
 	if table == "" {
 		table = DefaultTable
 	}
-	if err := validIdentifier("table", table); err != nil {
+	if err := validTableName(table); err != nil {
 		return "", err
 	}
-	qualified := quote(table)
 	if schema != "" {
 		if err := validIdentifier("schema", schema); err != nil {
 			return "", err
 		}
-		qualified = quote(schema) + "." + quote(table)
 	}
-	out := strings.ReplaceAll(schemaSQL, "$TABLE$", qualified)
+	out := strings.ReplaceAll(schemaSQL, "$TABLE$", qualify(schema, table))
+	out = strings.ReplaceAll(out, "$HOLDS$", qualify(schema, table+holdsSuffix))
+	out = strings.ReplaceAll(out, "$TOMBS$", qualify(schema, table+tombsSuffix))
 	return strings.ReplaceAll(out, "$NAME$", table), nil
 }
 
