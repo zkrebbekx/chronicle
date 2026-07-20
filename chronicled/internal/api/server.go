@@ -96,7 +96,10 @@ func NewHandler(d Deps) http.Handler {
 	root.HandleFunc("GET /readyz", s.handleReadyz)
 	root.Handle("/v1/", s.authenticate(api))
 
-	return s.logging(jsonMuxErrors(root))
+	// logging installs the status recorder and principal holder; recovering
+	// sits just inside it so a panic is caught, logged with the actor context,
+	// and rendered as JSON through the same recorder the logger reads.
+	return s.logging(s.recovering(jsonMuxErrors(root)))
 }
 
 // handleHealthz is liveness: the process is up and serving. No auth — an

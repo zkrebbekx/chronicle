@@ -80,6 +80,10 @@ func (s *Server) handlePlaceHold(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	principal, ok := s.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
 
 	hold, err := s.holds.PlaceHold(r.Context(), chronicle.Hold{
 		ID:            req.ID,
@@ -87,7 +91,7 @@ func (s *Server) handlePlaceHold(w http.ResponseWriter, r *http.Request) {
 		EntityID:      req.EntityID,
 		EffectiveFrom: effectiveFrom,
 		Reason:        req.Reason,
-		PlacedBy:      principalFrom(r.Context()).Actor,
+		PlacedBy:      principal.Actor,
 	})
 	if err != nil {
 		s.respondError(w, r, err)
@@ -119,8 +123,12 @@ func (s *Server) handleReleaseHold(w http.ResponseWriter, r *http.Request) {
 		s.respondError(w, r, badRequest("tx_forbidden", holdTimeForbiddenMsg))
 		return
 	}
+	principal, ok := s.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
 	hold, err := s.holds.ReleaseHold(r.Context(), r.PathValue("id"),
-		principalFrom(r.Context()).Actor, req.Reason)
+		principal.Actor, req.Reason)
 	if err != nil {
 		s.respondError(w, r, err)
 		return

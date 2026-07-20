@@ -16,7 +16,11 @@ import (
 // head, and nothing about an administrator who can recompute every hash.
 // Anchor heads externally (see chain-head) for more.
 func (s *Server) handleVerify(w http.ResponseWriter, r *http.Request) {
-	report, err := s.log.Verify(r.Context(), r.PathValue("kind"), r.PathValue("entity"))
+	kind, entity, ok := s.pathKindEntity(w, r)
+	if !ok {
+		return
+	}
+	report, err := s.log.Verify(r.Context(), kind, entity)
 	if err != nil {
 		s.respondError(w, r, err)
 		return
@@ -30,7 +34,10 @@ func (s *Server) handleVerify(w http.ResponseWriter, r *http.Request) {
 // later recomputed chain provable. Lodge the value somewhere the database
 // administrator cannot reach; chronicled ships no anchoring.
 func (s *Server) handleChainHead(w http.ResponseWriter, r *http.Request) {
-	kind, entity := r.PathValue("kind"), r.PathValue("entity")
+	kind, entity, ok := s.pathKindEntity(w, r)
+	if !ok {
+		return
+	}
 	head, err := s.log.ChainHead(r.Context(), kind, entity)
 	if err != nil {
 		s.respondError(w, r, err)

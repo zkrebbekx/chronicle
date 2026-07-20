@@ -74,7 +74,20 @@ func parseTime(field, value string) (time.Time, error) {
 		return time.Time{}, badRequest("invalid_argument",
 			fmt.Sprintf("%s must be an RFC 3339 timestamp such as 2026-03-01T00:00:00Z, got %q", field, value))
 	}
-	return t, nil
+	// Go's zero time renders as 0001-01-01T00:00:00Z, which is chronicle's
+	// unbounded/now sentinel. Accepting it as a literal timestamp lets a
+	// caller hit the sentinel by accident — an inverted-looking validTo that
+	// silently means "still holds", a validAt that silently means "now". The
+	// only way to ask for unbounded is to omit the field, so a literal zero is
+	// a mistake, and rejected as one.
+	if t.IsZero() {
+		return time.Time{}, badRequest("invalid_argument",
+			fmt.Sprintf("%s is chronicle's unbounded sentinel (%s); omit the field to mean unbounded or now", field, value))
+	}
+	// The store holds microseconds. Truncate here so the value the caller sees
+	// echoed in a 201 response is byte-identical to what a later read returns,
+	// rather than the nanosecond input the store never actually stored.
+	return t.UTC().Truncate(time.Microsecond), nil
 }
 
 // queryTime parses an optional RFC 3339 query parameter; absent means zero.
@@ -189,7 +202,11 @@ func (s *Server) handleWrite(w http.ResponseWriter, r *http.Request, correct boo
 		opts = append(opts, chronicle.WithSubject(req.Subject))
 	}
 
-	actor := principalFrom(r.Context()).Actor
+	principal, ok := s.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	actor := principal.Actor
 	write := s.log.Put
 	if correct {
 		write = s.log.Correct
@@ -206,6 +223,10 @@ func (s *Server) handleWrite(w http.ResponseWriter, r *http.Request, correct boo
 // "now" — this is a point lookup about the present unless pinned, matching
 // chronicle.As. Contrast with /v1/records, where absent means "no filter".
 func (s *Server) handleGet(w http.ResponseWriter, r *http.Request) {
+	kind, entity, ok := s.pathKindEntity(w, r)
+	if !ok {
+		return
+	}
 	q := r.URL.Query()
 	validAt, err := queryTime(q, "validAt")
 	if err != nil {
@@ -217,7 +238,7 @@ func (s *Server) handleGet(w http.ResponseWriter, r *http.Request) {
 		s.respondError(w, r, err)
 		return
 	}
-	rec, err := s.log.Get(r.Context(), r.PathValue("kind"), r.PathValue("entity"),
+	rec, err := s.log.Get(r.Context(), kind, entity,
 		chronicle.As{ValidAt: validAt, TxAt: txAt})
 	if err != nil {
 		s.respondError(w, r, err)
@@ -228,6 +249,10 @@ func (s *Server) handleGet(w http.ResponseWriter, r *http.Request) {
 
 // handleHistory is GET /v1/{kind}/{entity}/history with axis filters.
 func (s *Server) handleHistory(w http.ResponseWriter, r *http.Request) {
+	kind, entity, ok := s.pathKindEntity(w, r)
+	if !ok {
+		return
+	}
 	q := r.URL.Query()
 	var opts []chronicle.HistoryOption
 
@@ -293,7 +318,7 @@ func (s *Server) handleHistory(w http.ResponseWriter, r *http.Request) {
 		opts = append(opts, chronicle.Limit(n))
 	}
 
-	recs, err := s.log.History(r.Context(), r.PathValue("kind"), r.PathValue("entity"), opts...)
+	recs, err := s.log.History(r.Context(), kind, entity, opts...)
 	if err != nil {
 		s.respondError(w, r, err)
 		return
@@ -304,12 +329,16 @@ func (s *Server) handleHistory(w http.ResponseWriter, r *http.Request) {
 // handleTimeline is GET /v1/{kind}/{entity}/timeline?txAt=: the valid-time
 // sequence as believed at one transaction instant. Absent txAt means now.
 func (s *Server) handleTimeline(w http.ResponseWriter, r *http.Request) {
+	kind, entity, ok := s.pathKindEntity(w, r)
+	if !ok {
+		return
+	}
 	txAt, err := queryTime(r.URL.Query(), "txAt")
 	if err != nil {
 		s.respondError(w, r, err)
 		return
 	}
-	recs, err := s.log.Timeline(r.Context(), r.PathValue("kind"), r.PathValue("entity"),
+	recs, err := s.log.Timeline(r.Context(), kind, entity,
 		chronicle.As{TxAt: txAt})
 	if err != nil {
 		s.respondError(w, r, err)
@@ -322,6 +351,10 @@ func (s *Server) handleTimeline(w http.ResponseWriter, r *http.Request) {
 // Absent instants mean "now", per chronicle.As, so pinning only fromTxAt
 // diffs a past belief against the present one.
 func (s *Server) handleDiff(w http.ResponseWriter, r *http.Request) {
+	kind, entity, ok := s.pathKindEntity(w, r)
+	if !ok {
+		return
+	}
 	q := r.URL.Query()
 	var from, to chronicle.As
 	var err error
@@ -341,7 +374,7 @@ func (s *Server) handleDiff(w http.ResponseWriter, r *http.Request) {
 		s.respondError(w, r, err)
 		return
 	}
-	delta, err := s.log.Diff(r.Context(), r.PathValue("kind"), r.PathValue("entity"), from, to)
+	delta, err := s.log.Diff(r.Context(), kind, entity, from, to)
 	if err != nil {
 		s.respondError(w, r, err)
 		return
@@ -354,11 +387,21 @@ const (
 	maxQueryLimit     = 1000
 )
 
+// parseLimit reads an explicit limit query parameter, the same way for every
+// endpoint that accepts one: a positive integer, at most maxQueryLimit. Zero
+// is rejected rather than silently meaning "unbounded" on one endpoint and
+// "default" on another — a page size of zero asks for nothing, which is always
+// a mistake. Absence is handled by each caller (a full history, or the default
+// page size), never here.
 func parseLimit(v string) (int, error) {
 	n, err := strconv.Atoi(v)
-	if err != nil || n < 0 {
+	if err != nil || n < 1 {
 		return 0, badRequest("invalid_argument",
-			fmt.Sprintf("limit must be a non-negative integer, got %q", v))
+			fmt.Sprintf("limit must be a positive integer, got %q", v))
+	}
+	if n > maxQueryLimit {
+		return 0, badRequest("invalid_argument",
+			fmt.Sprintf("limit must be at most %d; page with the cursor instead", maxQueryLimit))
 	}
 	return n, nil
 }
@@ -368,6 +411,10 @@ func parseLimit(v string) (int, error) {
 // hide everything superseded, which is most of an audit log.
 func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
+	if err := rejectNUL("kind", q.Get("kind"), "entityId", q.Get("entityId"), "actorId", q.Get("actorId")); err != nil {
+		s.respondError(w, r, err)
+		return
+	}
 	query := chronicle.Query{
 		Kind:     q.Get("kind"),
 		EntityID: q.Get("entityId"),
@@ -424,14 +471,6 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			s.respondError(w, r, err)
 			return
-		}
-		if n > maxQueryLimit {
-			s.respondError(w, r, badRequest("invalid_argument",
-				fmt.Sprintf("limit must be at most %d; page with the cursor instead", maxQueryLimit)))
-			return
-		}
-		if n == 0 {
-			n = defaultQueryLimit
 		}
 		query.Limit = n
 	}

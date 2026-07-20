@@ -170,7 +170,7 @@ paths:
         - { name: txTo, in: query, schema: { type: string, format: date-time } }
         - { name: intent, in: query, schema: { type: string, enum: [assert, correction, remainder] } }
         - { name: actorId, in: query, schema: { type: string } }
-        - { name: limit, in: query, schema: { type: integer, minimum: 0 } }
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 1000 }, description: "Caps the number of versions returned; 1..1000. Omit for the full history." }
         - { name: descending, in: query, schema: { type: boolean } }
       responses:
         '200':
@@ -272,7 +272,7 @@ paths:
         - { name: txFrom, in: query, schema: { type: string, format: date-time }, description: With txTo, records whose transaction interval overlaps the range. }
         - { name: txTo, in: query, schema: { type: string, format: date-time } }
         - { name: currentOnly, in: query, schema: { type: boolean } }
-        - { name: limit, in: query, schema: { type: integer, minimum: 0, maximum: 1000 }, description: Page size; 0 or absent = 100. }
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 1000 }, description: "Page size; 1..1000, absent = 100." }
         - { name: cursor, in: query, schema: { type: string }, description: Opaque resumption token from a previous page. URL-encode it. }
         - { name: descending, in: query, schema: { type: boolean }, description: Must match the setting the cursor was produced under. }
       responses:
@@ -623,14 +623,19 @@ components:
           type: string
           description: |
             Stable machine-readable code mirroring chronicle's error
-            taxonomy. Values include not_found, no_chain, invalid_interval,
-            invalid_cursor, unknown_kind, unknown_intent, invalid_meta,
-            invalid_field, missing_entity_id, reserved_meta, missing_hold_id,
-            hold_exists, hold_released, conflict, current_record, shredded,
-            key_destroyed, codec, no_policy, invalid_policy, no_keyring,
-            unsupported, unavailable, unauthorized, forbidden,
+            taxonomy. Codes reachable in the default deployment: not_found,
+            no_chain, invalid_interval, invalid_cursor, unknown_intent,
+            invalid_meta, invalid_field, reserved_meta, missing_hold_id,
+            hold_exists, hold_released, shredded, key_destroyed, codec,
+            no_policy, invalid_policy, unavailable, unauthorized, forbidden,
             actor_forbidden, tx_forbidden, invalid_body, invalid_argument,
             body_too_large, method_not_allowed, internal.
+            Additional codes arise only in non-default deployments or from an
+            out-of-band writer to the same table: unknown_kind and
+            missing_entity_id (a store configured with a fixed kind set),
+            conflict (another writer to chronicle's table), current_record
+            (deletion of a live record), no_keyring and unsupported (a store
+            without a keyring, hold store or deleter).
         detail:
           description: Optional structured context, such as the resolved lookup coordinates on a not_found.
 

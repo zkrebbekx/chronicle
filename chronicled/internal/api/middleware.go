@@ -41,6 +41,51 @@ func principalFrom(ctx context.Context) *auth.Principal {
 	return nil
 }
 
+// rejectNUL reports a 400 for any caller-supplied string carrying a NUL byte,
+// which no store can hold. The library rejects NUL on its write paths but not
+// its read paths, so without this a NUL in a path segment or query filter
+// reaches pgstore and surfaces as a 500 — a caller minting internal errors at
+// will. Rejecting it here keeps the library's "identically everywhere" posture
+// true for reads too. The pairs are name/value; the first offender wins, so
+// the message is deterministic.
+func rejectNUL(pairs ...string) error {
+	for i := 0; i+1 < len(pairs); i += 2 {
+		if strings.IndexByte(pairs[i+1], 0) >= 0 {
+			return badRequest("invalid_argument",
+				pairs[i]+" contains a NUL byte, which no store can hold")
+		}
+	}
+	return nil
+}
+
+// pathKindEntity reads the {kind} and {entity} path segments and rejects a NUL
+// in either, the common preamble to every entity-scoped read handler. It
+// writes the error itself and reports ok=false when the caller should return.
+func (s *Server) pathKindEntity(w http.ResponseWriter, r *http.Request) (kind, entity string, ok bool) {
+	kind, entity = r.PathValue("kind"), r.PathValue("entity")
+	if err := rejectNUL("kind", kind, "entity", entity); err != nil {
+		s.respondError(w, r, err)
+		return "", "", false
+	}
+	return kind, entity, true
+}
+
+// requirePrincipal returns the authenticated actor for a write, or writes a
+// 500 and reports false. The authenticate middleware always populates the
+// principal before any /v1 handler runs, so a nil here means that invariant
+// was broken by a future wiring change — not caller input. Enforcing it beats
+// dereferencing on faith on the one path where a nil would record an empty
+// actor, the exact failure the whole service exists to prevent.
+func (s *Server) requirePrincipal(w http.ResponseWriter, r *http.Request) (*auth.Principal, bool) {
+	if p := principalFrom(r.Context()); p != nil {
+		return p, true
+	}
+	s.logger.Error("write reached a handler with no authenticated principal",
+		"method", r.Method, "path", r.URL.Path)
+	writeJSON(w, http.StatusInternalServerError, errorBody{Error: "internal error", Code: "internal"})
+	return nil, false
+}
+
 // authenticate guards everything under /v1/. It resolves the bearer token to
 // a principal or ends the request with 401. Role enforcement is per-handler
 // (see Server.admin); this middleware only establishes identity.
@@ -105,6 +150,33 @@ func (w *statusRecorder) Write(b []byte) (int, error) {
 		w.status = http.StatusOK
 	}
 	return w.ResponseWriter.Write(b)
+}
+
+// recovering turns a handler panic into the JSON error contract rather than a
+// bare dropped connection. Nothing in the service is expected to panic — the
+// write handlers guard their one assumed invariant explicitly — so this is a
+// backstop: it keeps "every error is a JSON body, nothing internal leaks" true
+// even for a logic bug, and logs the panic server-side for the operator. The
+// recovered value never reaches the client.
+func (s *Server) recovering(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer func() {
+			if v := recover(); v != nil {
+				s.logger.Error("handler panic",
+					"method", r.Method, "path", r.URL.Path, "panic", v)
+				// If the handler already began writing, the status is sent and
+				// there is nothing to correct; only emit the error body when
+				// the response has not started.
+				if rec, ok := w.(*statusRecorder); !ok || rec.status == 0 {
+					writeJSON(w, http.StatusInternalServerError, errorBody{
+						Error: "internal error",
+						Code:  "internal",
+					})
+				}
+			}
+		}()
+		next.ServeHTTP(w, r)
+	})
 }
 
 // logging emits one structured line per request: method, path, status,

@@ -29,6 +29,10 @@ func (s *Server) handleDestroyKey(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	subject := r.PathValue("subject")
+	if err := rejectNUL("subject", subject); err != nil {
+		s.respondError(w, r, err)
+		return
+	}
 	if err := s.keyring.DestroyKey(r.Context(), subject); err != nil {
 		s.respondError(w, r, err)
 		return

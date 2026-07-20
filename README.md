@@ -694,8 +694,9 @@ anyone holding a token *is* that actor. Put mTLS or an OIDC-aware proxy in
 front for anything bigger; chronicled deliberately does not grow an identity
 provider. Configuration is environment-only (`CHRONICLED_DSN`,
 `CHRONICLED_ADDR`, `CHRONICLED_TOKENS` or `CHRONICLED_TOKENS_FILE`,
-`CHRONICLED_CHAINING`, `CHRONICLED_MIGRATE`, timeouts) and the service fails
-fast, with an actionable message, on anything malformed. Migration is opt-in
+`CHRONICLED_CHAINING`, `CHRONICLED_MIGRATE`, `CHRONICLED_LOG_LEVEL`, timeouts)
+and the service fails fast, with an actionable message, on anything malformed.
+Migration is opt-in
 and off by default — production schema changes should be explicit. Horizontal
 replicas are safe because pgstore assigns transaction time from the database
 clock; within one replica writes serialize through the process's single

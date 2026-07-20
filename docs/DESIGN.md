@@ -486,6 +486,18 @@ deployment ever needs since-forever assertions over HTTP the right shape is
 an explicit sentinel (an `"unbounded": true` companion field, or accepting
 the literal string), never a defaulting absent field.
 
+A related trap the review surfaced: Go's zero time renders in RFC 3339 as
+`0001-01-01T00:00:00Z`, which is exactly the value the library reads as
+unbounded/now. A caller sending that literal string could reach the sentinel
+by accident — a `validTo` that looks inverted but silently means "still
+holds", a `validAt` that silently means "now". The service therefore rejects
+the zero rendering on every timestamp field with a 400, so the only way to
+mean unbounded stays "omit the field", consistent with the reasoning above.
+Caller valid times are also truncated to the store's microsecond resolution
+at the boundary, so the record echoed in a write response is byte-identical
+to what a later read returns rather than the nanosecond input the store
+never held.
+
 Two smaller notes, recorded rather than papered over. First, the retention
 sweep endpoint computes `now` from the service clock while hold releases and
 supersessions are stamped by the database clock; retain's documented skew
