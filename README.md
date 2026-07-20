@@ -48,9 +48,13 @@ in-browser demo that makes the two time axes clickable. Load the *retroactive
 salary correction* story and watch the old belief and the correction coexist as
 two boxes on the valid-time × transaction-time grid.
 
-> **Status: phase 3.** The core model, the in-memory store, the Postgres
-> adapter and the compliance layer — retention, legal hold, optional tamper
-> evidence, crypto-shredding — are in. The REST service is a later phase. See
+> **Status: released.** The core model, the in-memory store, the Postgres
+> adapter, the compliance layer (retention, legal hold, optional tamper
+> evidence, crypto-shredding), field-level history, and the `chronicled` REST
+> service are all in and tagged — root `v0.2.0`, `pgstore/v0.1.2`,
+> `chronicled/v0.2.0`. Try it in the browser: the
+> [playground](https://zkrebbekx.github.io/chronicle/) compiles the library to
+> WebAssembly and makes the two time axes clickable. See
 > [docs/DESIGN.md](docs/DESIGN.md).
 
 ## The question that justifies the library
