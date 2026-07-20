@@ -442,7 +442,12 @@ func (s *Server) handleFieldHistory(w http.ResponseWriter, r *http.Request) {
 		s.respondError(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, toFieldHistoryResponse(path, validAt, revs))
+	resp, err := toFieldHistoryResponse(path, validAt, revs)
+	if err != nil {
+		s.respondError(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
 const (

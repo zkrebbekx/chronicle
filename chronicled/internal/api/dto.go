@@ -4,6 +4,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"time"
 
 	"github.com/zkrebbekx/chronicle"
@@ -186,16 +187,21 @@ type fieldValueDTO struct {
 	Value   json.RawMessage `json:"value,omitempty"`
 }
 
-func toFieldValueDTO(v chronicle.FieldValue) fieldValueDTO {
+func toFieldValueDTO(v chronicle.FieldValue) (fieldValueDTO, error) {
 	dto := fieldValueDTO{Present: v.Present}
 	if v.Present {
-		// The value came from decoding a stored record, so re-marshalling it
-		// cannot fail; a present field always renders its value, null included.
-		if raw, err := json.Marshal(v.Value); err == nil {
-			dto.Value = raw
+		// The value came from decoding a stored record, so with the shipped
+		// JSONCodec re-marshalling cannot fail. Should a custom codec ever make
+		// it fail, rendering {"present":true} with no value would be an ambiguous
+		// half-absent field — exactly the silent data loss an audit response must
+		// not have — so it is an error, surfaced as a 500, not swallowed.
+		raw, err := json.Marshal(v.Value)
+		if err != nil {
+			return fieldValueDTO{}, fmt.Errorf("rendering a present field value: %w", err)
 		}
+		dto.Value = raw
 	}
-	return dto
+	return dto, nil
 }
 
 type fieldRevisionDTO struct {
@@ -218,17 +224,25 @@ type fieldHistoryResponse struct {
 	Changes []fieldRevisionDTO `json:"changes"`
 }
 
-func toFieldHistoryResponse(path string, validAt time.Time, revs []chronicle.FieldRevision) fieldHistoryResponse {
+func toFieldHistoryResponse(path string, validAt time.Time, revs []chronicle.FieldRevision) (fieldHistoryResponse, error) {
 	out := fieldHistoryResponse{
 		Path:    path,
 		ValidAt: fmtTime(validAt),
 		Changes: make([]fieldRevisionDTO, 0, len(revs)),
 	}
 	for _, r := range revs {
+		from, err := toFieldValueDTO(r.From)
+		if err != nil {
+			return fieldHistoryResponse{}, err
+		}
+		to, err := toFieldValueDTO(r.To)
+		if err != nil {
+			return fieldHistoryResponse{}, err
+		}
 		out.Changes = append(out.Changes, fieldRevisionDTO{
 			Path:      r.Path,
-			From:      toFieldValueDTO(r.From),
-			To:        toFieldValueDTO(r.To),
+			From:      from,
+			To:        to,
 			TxAt:      fmtTime(r.TxAt),
 			ValidFrom: fmtTime(r.ValidFrom),
 			ValidTo:   fmtTime(r.ValidTo),
@@ -237,7 +251,7 @@ func toFieldHistoryResponse(path string, validAt time.Time, revs []chronicle.Fie
 			Intent:    r.Intent.String(),
 		})
 	}
-	return out
+	return out, nil
 }
 
 type holdDTO struct {
