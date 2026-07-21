@@ -1,3 +1,9 @@
+<p align="center">
+  <a href="https://zkrebbekx.github.io/chronicle/">
+    <img src="docs/assets/social-preview.png" alt="chronicle — bitemporal entity history for Go" width="720">
+  </a>
+</p>
+
 # chronicle
 
 Bitemporal entity change history for Go — an ORM-agnostic, queryable record of
